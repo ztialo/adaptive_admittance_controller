@@ -13,7 +13,7 @@ The following configurations are available:
 
 Reference: https://github.com/frankaemika/franka_ros
 """
-
+from pathlib import Path
 
 import isaaclab.sim as sim_utils
 from isaaclab.actuators import ImplicitActuatorCfg
@@ -22,10 +22,12 @@ from isaaclab.assets.articulation import ArticulationCfg
 ##
 # Configuration
 ##
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_FRANKA_USD_PATH = str(_REPO_ROOT / "assets" / "franka3.usd")
 
 FRANKA_3_CFG = ArticulationCfg(
     spawn=sim_utils.UsdFileCfg(
-        usd_path="franka3.usd",
+        usd_path=_FRANKA_USD_PATH,
         activate_contact_sensors=False,
         rigid_props=sim_utils.RigidBodyPropertiesCfg(
             disable_gravity=False,
@@ -86,7 +88,7 @@ This configuration is useful for task-space control using differential IK.
 
 
 FRANKA_ROBOTIQ_GRIPPER_CFG = FRANKA_3_CFG.copy()
-FRANKA_ROBOTIQ_GRIPPER_CFG.spawn.usd_path = "franka3.usd"
+FRANKA_ROBOTIQ_GRIPPER_CFG.spawn.usd_path = _FRANKA_USD_PATH
 FRANKA_ROBOTIQ_GRIPPER_CFG.spawn.variants = {"Gripper": "Robotiq_2F_85"}
 FRANKA_ROBOTIQ_GRIPPER_CFG.spawn.rigid_props.disable_gravity = True
 FRANKA_ROBOTIQ_GRIPPER_CFG.init_state.joint_pos = {

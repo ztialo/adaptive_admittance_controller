@@ -19,10 +19,15 @@ mass matricescomputed by PhysX.
 """Launch Isaac Sim Simulator first."""
 
 import argparse
-import os
+import sys
 from datetime import datetime
+from pathlib import Path
 
 from isaaclab.app import AppLauncher
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 # add argparse arguments
 parser = argparse.ArgumentParser(description="Tutorial on using the operational space controller.")
@@ -80,7 +85,7 @@ from isaaclab.utils.math import (
 ##
 # Pre-defined configs
 ##
-from franka import FRANKA_3_HIGH_PD_CFG  # isort:skip  # noqa: E402
+from source.franka import FRANKA_3_HIGH_PD_CFG  # isort:skip  # noqa: E402
 # pylint: enable=wrong-import-position
 
 
@@ -182,12 +187,12 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
         print(f"[WARN] Failed to resolve FT body index for '{ft_body_name}': {exc}.")
 
     # Setup FT logging.
-    logs_root = os.path.join("logs", "baseline_osc")
-    os.makedirs(logs_root, exist_ok=True)
+    logs_root = REPO_ROOT / "logs" / "baseline_osc"
+    logs_root.mkdir(parents=True, exist_ok=True)
     run_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = os.path.join(logs_root, run_tag)
-    os.makedirs(run_dir, exist_ok=True)
-    ft_log_path = os.path.join(run_dir, "ft_env0.csv")
+    run_dir = logs_root / run_tag
+    run_dir.mkdir(parents=True, exist_ok=True)
+    ft_log_path = run_dir / "ft_env0.csv"
     ft_csv_file = open(ft_log_path, "w", newline="", encoding="utf-8")
     ft_writer = csv.writer(ft_csv_file)
     ft_writer.writerow(
@@ -223,7 +228,7 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
     video_writer = None
     video_path = None
     if args_cli.record:
-        video_path = os.path.join(run_dir, "baseline_osc_env0.mp4")
+        video_path = run_dir / "baseline_osc_env0.mp4"
         fps = max(1, int(round(1.0 / sim.get_physics_dt())))
         video_writer = imageio.get_writer(video_path, fps=fps)
         print(f"[INFO] Recording video to: {video_path}")
