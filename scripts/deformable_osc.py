@@ -220,14 +220,15 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
     # Obtain indices for the end-effector and arm joints
     ee_frame_name = "fr3_leftfinger"
     arm_joint_names = ["fr3_joint.*"]
+    finger_joint_names = ["fr3_finger_joint.*"]
     ee_frame_idx = robot.find_bodies(ee_frame_name)[0][0]
     arm_joint_ids = robot.find_joints(arm_joint_names)[0]
+    finger_joint_ids = robot.find_joints(finger_joint_names)[0]
     env_origins = scene.env_origins
 
-    # Side view camera: place on +Y side and look at environment center.
-    camera_positions = env_origins + torch.tensor([0.0, 3.0, 1.3], device=sim.device)
-    # Approx. 10 deg right and 3 deg up from the previous side-view target.
-    camera_targets = env_origins + torch.tensor([0.529, 0.0, 0.427], device=sim.device)
+    # Side view camera: move further right and yaw left to keep wall/object centered.
+    camera_positions = env_origins + torch.tensor([-0.35, 3.0, 1.35], device=sim.device, dtype=env_origins.dtype)
+    camera_targets = env_origins + torch.tensor([0.62, 0.0, 0.74], device=sim.device, dtype=env_origins.dtype)
     observer_camera.set_world_poses_from_view(camera_positions, camera_targets)
 
     # Resolve FT body index for the joint /World/envs/env_0/Robot/fr3/fr3_link8/fr3_hand_joint
@@ -422,6 +423,7 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
     # Set joint efforts to zero
     zero_joint_efforts = torch.zeros(scene.num_envs, robot.num_joints, device=sim.device)
     joint_efforts = torch.zeros(scene.num_envs, len(arm_joint_ids), device=sim.device)
+    finger_pos_des = torch.zeros(scene.num_envs, len(finger_joint_ids), device=sim.device)
 
     count = 0
     try:
@@ -432,6 +434,8 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
                 # reset joint state to default
                 default_joint_pos = robot.data.default_joint_pos.clone()
                 default_joint_vel = robot.data.default_joint_vel.clone()
+                # Keep gripper closed at all times.
+                default_joint_pos[:, finger_joint_ids] = 0.0
                 robot.write_joint_state_to_sim(default_joint_pos, default_joint_vel)
                 robot.set_joint_effort_target(zero_joint_efforts)  # Set zero torques in the initial step
                 robot.write_data_to_sim()
@@ -455,6 +459,8 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
                     current_ee_pose_b=ee_pose_b,
                     current_task_frame_pose_b=task_frame_pose_b,
                 )
+                robot.set_joint_position_target(finger_pos_des, joint_ids=finger_joint_ids)
+                robot.write_data_to_sim()
             else:
                 # get the updated states
                 (
@@ -483,6 +489,7 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
                 )
                 # apply actions
                 robot.set_joint_effort_target(joint_efforts, joint_ids=arm_joint_ids)
+                robot.set_joint_position_target(finger_pos_des, joint_ids=finger_joint_ids)
                 robot.write_data_to_sim()
 
             soft_block.write_nodal_kinematic_target_to_sim(wall_nodal_kinematic_target)

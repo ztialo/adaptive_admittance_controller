@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Plot baseline_osc FT/EE logs (supports old and new CSV schemas)."""
+"""Plot admittance/baseline CSV logs."""
 
 import argparse
 import csv
@@ -17,11 +17,17 @@ def _float_or_nan(value: str | None) -> float:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Plot baseline_osc CSV logs")
+    parser = argparse.ArgumentParser(description="Plot admittance/baseline CSV logs")
     parser.add_argument("csv_path", type=Path, help="Path to CSV file")
     parser.add_argument("--x-axis", choices=["step", "time"], default="step", help="X-axis type")
     parser.add_argument("--save", type=Path, default=None, help="Output image path (default: CSV stem + .png)")
     parser.add_argument("--show", action="store_true", help="Display plot window")
+    parser.add_argument(
+        "--kinst-min-compression",
+        type=float,
+        default=5.0e-4,
+        help="Minimum compression (m) used for k_inst and k_fit (default: 0.5 mm).",
+    )
     args = parser.parse_args()
 
     if not args.csv_path.exists():
@@ -29,24 +35,34 @@ def main():
 
     steps: list[int] = []
     times: list[datetime] = []
-    wrench_rows: list[list[float]] = []
-    has_ee_cols = False
-    ee_err_norm: list[float] = []
-    ee_pos_err_xyz: list[list[float]] = []
+    fz_values: list[float] = []
+    f_des_values: list[float] = []
+    has_x_cols = False
+    x_curr_values: list[float] = []
+    x_nom_values: list[float] = []
+    x_cmd_values: list[float] = []
+    x_n_values: list[float] = []
+    contact_active_values: list[float] = []
     stiffness_values: list[float] = []
     damping_values: list[float] = []
+    youngs_modulus_values: list[float] = []
 
     with args.csv_path.open("r", newline="") as f:
         reader = csv.DictReader(f)
         if reader.fieldnames is None:
             raise ValueError("CSV has no header.")
         fieldnames = set(reader.fieldnames)
-        has_ee_cols = "ee_pos_err_b_norm" in fieldnames
+        has_x_cols = "ee_pos_b_x" in fieldnames and "ee_goal_pos_b_x" in fieldnames
         has_old_stiffness_col = "wall_youngs_modulus_pa" in fieldnames
         has_new_stiffness_col = "wall_compliant_contact_stiffness" in fieldnames
         has_new_damping_col = "wall_compliant_contact_damping" in fieldnames
+        has_youngs_modulus_col = "youngs_modulus_pa" in fieldnames
+        has_x_cmd_col = "x_cmd_b_x" in fieldnames
+        has_x_n_col = "x_n" in fieldnames
+        has_contact_active_col = "contact_active" in fieldnames
 
-        required = {"wall_time_iso", "step", "fx", "fy", "fz", "tx", "ty", "tz"}
+        has_f_des_col = "f_des_n" in fieldnames
+        required = {"wall_time_iso", "step", "fz"}
         if not required.issubset(fieldnames):
             missing = sorted(required - fieldnames)
             raise ValueError(f"CSV missing required columns: {missing}")
@@ -54,37 +70,33 @@ def main():
         for row in reader:
             steps.append(int(row["step"]))
             times.append(datetime.fromisoformat(row["wall_time_iso"]))
-            wrench_rows.append(
-                [
-                    _float_or_nan(row.get("fx")),
-                    _float_or_nan(row.get("fy")),
-                    _float_or_nan(row.get("fz")),
-                    _float_or_nan(row.get("tx")),
-                    _float_or_nan(row.get("ty")),
-                    _float_or_nan(row.get("tz")),
-                ]
-            )
+            fz_values.append(_float_or_nan(row.get("fz")))
+            if has_f_des_col:
+                f_des_values.append(_float_or_nan(row.get("f_des_n")))
 
-            if has_ee_cols:
-                ee_err_norm.append(_float_or_nan(row.get("ee_pos_err_b_norm")))
-                ee_pos_err_xyz.append(
-                    [
-                        _float_or_nan(row.get("ee_pos_err_b_x")),
-                        _float_or_nan(row.get("ee_pos_err_b_y")),
-                        _float_or_nan(row.get("ee_pos_err_b_z")),
-                    ]
-                )
+            if has_x_cols:
+                x_curr_values.append(_float_or_nan(row.get("ee_pos_b_x")))
+                x_nom_values.append(_float_or_nan(row.get("ee_goal_pos_b_x")))
+            if has_x_cmd_col:
+                x_cmd_values.append(_float_or_nan(row.get("x_cmd_b_x")))
+            if has_x_n_col:
+                x_n_values.append(_float_or_nan(row.get("x_n")))
+            if has_contact_active_col:
+                contact_active_values.append(_float_or_nan(row.get("contact_active")))
             if has_old_stiffness_col:
                 stiffness_values.append(_float_or_nan(row.get("wall_youngs_modulus_pa")))
             if has_new_stiffness_col:
                 stiffness_values.append(_float_or_nan(row.get("wall_compliant_contact_stiffness")))
             if has_new_damping_col:
                 damping_values.append(_float_or_nan(row.get("wall_compliant_contact_damping")))
+            if has_youngs_modulus_col:
+                youngs_modulus_values.append(_float_or_nan(row.get("youngs_modulus_pa")))
 
-    if not wrench_rows:
+    if not fz_values:
         raise ValueError("No valid rows found in CSV.")
 
-    wrench = np.asarray(wrench_rows, dtype=float)
+    fz = np.asarray(fz_values, dtype=float)
+    f_des = np.asarray(f_des_values, dtype=float) if f_des_values else None
     if args.x_axis == "time":
         t0 = times[0]
         x = np.array([(t - t0).total_seconds() for t in times], dtype=float)
@@ -93,26 +105,30 @@ def main():
         x = np.asarray(steps, dtype=float)
         x_label = "Step"
 
-    # Layout: top 2x3 = wrench always; bottom row for EE error if present.
-    if has_ee_cols:
-        fig = plt.figure(figsize=(14, 11))
-        gs = fig.add_gridspec(3, 3)
-        wrench_axes = [fig.add_subplot(gs[r, c]) for r in range(2) for c in range(3)]
-        err_norm_ax = fig.add_subplot(gs[2, 0])
-        err_xyz_ax = fig.add_subplot(gs[2, 1:])
+    # Layout: always 3 rows x 1 column so x-axis lines up across plots.
+    fig, axes = plt.subplots(3, 1, figsize=(14, 10), sharex=True)
+    force_ax, x_pos_ax, stiffness_ax = axes
+
+    force_ax.plot(x, fz, linewidth=1.4, color="tab:blue", label="Fz")
+    if f_des is not None and len(f_des) == len(fz):
+        force_ax.plot(x, f_des, linewidth=1.4, color="tab:orange", label="Fdes")
+    force_ax.set_title("Contact Force (Fz)")
+    force_ax.set_xlabel(x_label)
+    force_ax.set_ylabel("N")
+    force_ax.grid(True, alpha=0.3)
+    force_ax.legend(loc="best")
+
+    # Prefer the log family folder name (e.g. ".../admittance_baseline/<run>/ft_env0.csv").
+    if args.csv_path.parent.parent.exists():
+        run_family_name = args.csv_path.parent.parent.name
     else:
-        fig, axes = plt.subplots(2, 3, figsize=(14, 8), sharex=True)
-        wrench_axes = list(axes.flat)
-
-    labels = ["Fx", "Fy", "Fz", "Tx", "Ty", "Tz"]
-    for i, ax in enumerate(wrench_axes):
-        ax.plot(x, wrench[:, i], linewidth=1.2, color="tab:blue")
-        ax.set_title(labels[i])
-        ax.grid(True, alpha=0.3)
-        if i >= 3:
-            ax.set_xlabel(x_label)
-
-    title = f"Baseline OSC Log\n{args.csv_path.name}"
+        run_family_name = args.csv_path.parent.name
+    subtitle = args.csv_path.name
+    if youngs_modulus_values:
+        unique_ym = np.unique(np.asarray(youngs_modulus_values, dtype=float))
+        if len(unique_ym) == 1:
+            subtitle = f"Young's modulus: {unique_ym[0]:.3g} Pa"
+    title = f"{run_family_name}\n{subtitle}"
     if stiffness_values:
         unique_stiff = np.unique(np.asarray(stiffness_values, dtype=float))
         if len(unique_stiff) == 1:
@@ -124,26 +140,60 @@ def main():
         unique_damp = np.unique(np.asarray(damping_values, dtype=float))
         if len(unique_damp) == 1:
             title += f", d={unique_damp[0]:.3g}"
+
+    if has_x_cols:
+        x_curr = np.asarray(x_curr_values, dtype=float)
+        x_nom = np.asarray(x_nom_values, dtype=float)
+        x_pos_ax.plot(x, x_nom, color="tab:gray", linewidth=1.2, label="x_nom (no compression)")
+        x_pos_ax.plot(x, x_curr, color="tab:green", linewidth=1.2, label="x_curr (compression)")
+        if x_cmd_values and len(x_cmd_values) == len(x):
+            x_cmd = np.asarray(x_cmd_values, dtype=float)
+            x_pos_ax.plot(x, x_cmd, color="tab:blue", linewidth=1.2, label="x_cmd (admittance)")
+        x_pos_ax.set_title("X Position: Nominal vs Current")
+        x_pos_ax.set_ylabel("m")
+        x_pos_ax.grid(True, alpha=0.3)
+        x_pos_ax.legend(loc="best")
+
+        if x_n_values:
+            x_comp = np.asarray(x_n_values, dtype=float)
+        else:
+            x_comp = x_curr - x_nom
+        contact_active = np.asarray(contact_active_values, dtype=float) if contact_active_values else None
+        valid = np.isfinite(x_comp) & np.isfinite(fz) & (x_comp > args.kinst_min_compression)
+        if contact_active is not None and len(contact_active) == len(x_comp):
+            valid &= contact_active > 0.5
+
+        k_inst = np.full_like(x_comp, np.nan, dtype=float)
+        k_inst[valid] = fz[valid] / x_comp[valid]
+        stiffness_ax.plot(x, k_inst, color="tab:purple", linewidth=1.2, label="k_inst = Fz / x_comp")
+
+        if np.count_nonzero(valid) >= 2:
+            x_fit = x_comp[valid]
+            f_fit = fz[valid]
+            # Linear fit with intercept: F = k*x + b.
+            k_fit, b_fit = np.polyfit(x_fit, f_fit, 1)
+            k_med = float(np.nanmedian(k_inst[valid]))
+            stiffness_ax.set_title(f"Empirical Stiffness: k_fit={k_fit:.3g} N/m, median={k_med:.3g} N/m")
+            stiffness_ax.axhline(k_fit, color="tab:red", linestyle="--", linewidth=1.0, label="k_fit")
+            stiffness_ax.axhline(k_med, color="tab:orange", linestyle=":", linewidth=1.0, label="k_median")
+            title += f" | k_fit={k_fit:.3g} N/m, b={b_fit:.3g} N"
+        else:
+            stiffness_ax.set_title("Empirical Stiffness (insufficient contact samples)")
+    else:
+        x_pos_ax.set_title("X Position: unavailable in CSV")
+        x_pos_ax.set_ylabel("m")
+        x_pos_ax.grid(True, alpha=0.3)
+        stiffness_ax.set_title("Empirical Stiffness: unavailable in CSV")
+        stiffness_ax.set_ylabel("N/m")
+        stiffness_ax.grid(True, alpha=0.3)
+
+    stiffness_ax.set_xlabel(x_label)
+    stiffness_ax.set_ylabel("N/m")
+    stiffness_ax.grid(True, alpha=0.3)
+    if stiffness_ax.has_data():
+        stiffness_ax.legend(loc="best")
+
     fig.suptitle(title)
-
-    if has_ee_cols:
-        err_norm = np.asarray(ee_err_norm, dtype=float)
-        err_xyz = np.asarray(ee_pos_err_xyz, dtype=float)
-        err_norm_ax.plot(x, err_norm, color="tab:red", linewidth=1.2)
-        err_norm_ax.set_title("EE Position Error Norm")
-        err_norm_ax.set_xlabel(x_label)
-        err_norm_ax.set_ylabel("m")
-        err_norm_ax.grid(True, alpha=0.3)
-
-        err_xyz_ax.plot(x, err_xyz[:, 0], label="err_x", linewidth=1.1)
-        err_xyz_ax.plot(x, err_xyz[:, 1], label="err_y", linewidth=1.1)
-        err_xyz_ax.plot(x, err_xyz[:, 2], label="err_z", linewidth=1.1)
-        err_xyz_ax.set_title("EE Position Error Components")
-        err_xyz_ax.set_xlabel(x_label)
-        err_xyz_ax.set_ylabel("m")
-        err_xyz_ax.grid(True, alpha=0.3)
-        err_xyz_ax.legend(loc="best")
-
     plt.tight_layout()
     save_path = args.save if args.save is not None else args.csv_path.with_suffix(".png")
     fig.savefig(save_path, dpi=160)

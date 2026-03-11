@@ -23,7 +23,7 @@ from isaaclab.assets.articulation import ArticulationCfg
 # Configuration
 ##
 _REPO_ROOT = Path(__file__).resolve().parent.parent
-_FRANKA_USD_PATH = str(_REPO_ROOT / "assets" / "franka3.usd")
+_FRANKA_USD_PATH = str(_REPO_ROOT / "assets" / "fr3_gripper_locked.usd")
 
 FRANKA_3_CFG = ArticulationCfg(
     spawn=sim_utils.UsdFileCfg(
@@ -47,7 +47,6 @@ FRANKA_3_CFG = ArticulationCfg(
             "fr3_joint5": 0.0,
             "fr3_joint6": 3.037,
             "fr3_joint7": 0.741,
-            "fr3_finger_joint.*": 0.04,
         },
     ),
     actuators={
@@ -62,12 +61,6 @@ FRANKA_3_CFG = ArticulationCfg(
             effort_limit_sim=12.0,
             stiffness=80.0,
             damping=4.0,
-        ),
-        "franka_hand": ImplicitActuatorCfg(
-            joint_names_expr=["fr3_finger_joint.*"],
-            effort_limit_sim=200.0,
-            stiffness=2e3,
-            damping=1e2,
         ),
     },
     soft_joint_pos_limit_factor=1.0,
