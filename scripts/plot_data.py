@@ -22,12 +22,6 @@ def main():
     parser.add_argument("--x-axis", choices=["step", "time"], default="step", help="X-axis type")
     parser.add_argument("--save", type=Path, default=None, help="Output image path (default: CSV stem + .png)")
     parser.add_argument("--show", action="store_true", help="Display plot window")
-    parser.add_argument(
-        "--kinst-min-compression",
-        type=float,
-        default=5.0e-4,
-        help="Minimum compression (m) used for k_inst and k_fit (default: 0.5 mm).",
-    )
     args = parser.parse_args()
 
     if not args.csv_path.exists():
@@ -41,8 +35,8 @@ def main():
     x_curr_values: list[float] = []
     x_nom_values: list[float] = []
     x_cmd_values: list[float] = []
-    x_n_values: list[float] = []
-    contact_active_values: list[float] = []
+    x_dot_values: list[float] = []
+    x_ddot_values: list[float] = []
     stiffness_values: list[float] = []
     damping_values: list[float] = []
     youngs_modulus_values: list[float] = []
@@ -58,8 +52,8 @@ def main():
         has_new_damping_col = "wall_compliant_contact_damping" in fieldnames
         has_youngs_modulus_col = "youngs_modulus_pa" in fieldnames
         has_x_cmd_col = "x_cmd_b_x" in fieldnames
-        has_x_n_col = "x_n" in fieldnames
-        has_contact_active_col = "contact_active" in fieldnames
+        has_x_dot_col = "admittance_velocity" in fieldnames
+        has_x_ddot_col = "admittance_acceleration" in fieldnames
 
         has_f_des_col = "f_des_n" in fieldnames
         required = {"wall_time_iso", "step", "fz"}
@@ -79,10 +73,10 @@ def main():
                 x_nom_values.append(_float_or_nan(row.get("ee_goal_pos_b_x")))
             if has_x_cmd_col:
                 x_cmd_values.append(_float_or_nan(row.get("x_cmd_b_x")))
-            if has_x_n_col:
-                x_n_values.append(_float_or_nan(row.get("x_n")))
-            if has_contact_active_col:
-                contact_active_values.append(_float_or_nan(row.get("contact_active")))
+            if has_x_dot_col:
+                x_dot_values.append(_float_or_nan(row.get("admittance_velocity")))
+            if has_x_ddot_col:
+                x_ddot_values.append(_float_or_nan(row.get("admittance_acceleration")))
             if has_old_stiffness_col:
                 stiffness_values.append(_float_or_nan(row.get("wall_youngs_modulus_pa")))
             if has_new_stiffness_col:
@@ -107,7 +101,7 @@ def main():
 
     # Layout: always 3 rows x 1 column so x-axis lines up across plots.
     fig, axes = plt.subplots(3, 1, figsize=(14, 10), sharex=True)
-    force_ax, x_pos_ax, stiffness_ax = axes
+    force_ax, x_pos_ax, x_dyn_ax = axes
 
     force_ax.plot(x, fz, linewidth=1.4, color="tab:blue", label="Fz")
     if f_des is not None and len(f_des) == len(fz):
@@ -154,44 +148,25 @@ def main():
         x_pos_ax.grid(True, alpha=0.3)
         x_pos_ax.legend(loc="best")
 
-        if x_n_values:
-            x_comp = np.asarray(x_n_values, dtype=float)
+        if x_dot_values and x_ddot_values and len(x_dot_values) == len(x) and len(x_ddot_values) == len(x):
+            x_dot = np.asarray(x_dot_values, dtype=float)
+            x_ddot = np.asarray(x_ddot_values, dtype=float)
+            x_dyn_ax.plot(x, x_dot, color="tab:purple", linewidth=1.2, label="x_dot")
+            x_dyn_ax.plot(x, x_ddot, color="tab:red", linewidth=1.2, label="x_ddot")
+            x_dyn_ax.set_title("Admittance Dynamics")
         else:
-            x_comp = x_curr - x_nom
-        contact_active = np.asarray(contact_active_values, dtype=float) if contact_active_values else None
-        valid = np.isfinite(x_comp) & np.isfinite(fz) & (x_comp > args.kinst_min_compression)
-        if contact_active is not None and len(contact_active) == len(x_comp):
-            valid &= contact_active > 0.5
-
-        k_inst = np.full_like(x_comp, np.nan, dtype=float)
-        k_inst[valid] = fz[valid] / x_comp[valid]
-        stiffness_ax.plot(x, k_inst, color="tab:purple", linewidth=1.2, label="k_inst = Fz / x_comp")
-
-        if np.count_nonzero(valid) >= 2:
-            x_fit = x_comp[valid]
-            f_fit = fz[valid]
-            # Linear fit with intercept: F = k*x + b.
-            k_fit, b_fit = np.polyfit(x_fit, f_fit, 1)
-            k_med = float(np.nanmedian(k_inst[valid]))
-            stiffness_ax.set_title(f"Empirical Stiffness: k_fit={k_fit:.3g} N/m, median={k_med:.3g} N/m")
-            stiffness_ax.axhline(k_fit, color="tab:red", linestyle="--", linewidth=1.0, label="k_fit")
-            stiffness_ax.axhline(k_med, color="tab:orange", linestyle=":", linewidth=1.0, label="k_median")
-            title += f" | k_fit={k_fit:.3g} N/m, b={b_fit:.3g} N"
-        else:
-            stiffness_ax.set_title("Empirical Stiffness (insufficient contact samples)")
+            x_dyn_ax.set_title("Admittance Dynamics: unavailable in CSV")
     else:
         x_pos_ax.set_title("X Position: unavailable in CSV")
         x_pos_ax.set_ylabel("m")
         x_pos_ax.grid(True, alpha=0.3)
-        stiffness_ax.set_title("Empirical Stiffness: unavailable in CSV")
-        stiffness_ax.set_ylabel("N/m")
-        stiffness_ax.grid(True, alpha=0.3)
+        x_dyn_ax.set_title("Admittance Dynamics: unavailable in CSV")
 
-    stiffness_ax.set_xlabel(x_label)
-    stiffness_ax.set_ylabel("N/m")
-    stiffness_ax.grid(True, alpha=0.3)
-    if stiffness_ax.has_data():
-        stiffness_ax.legend(loc="best")
+    x_dyn_ax.set_xlabel(x_label)
+    x_dyn_ax.set_ylabel("m/s, m/s^2")
+    x_dyn_ax.grid(True, alpha=0.3)
+    if x_dyn_ax.has_data():
+        x_dyn_ax.legend(loc="best")
 
     fig.suptitle(title)
     plt.tight_layout()

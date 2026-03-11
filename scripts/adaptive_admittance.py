@@ -29,21 +29,13 @@ parser = argparse.ArgumentParser(description="Rigid-wall baseline 1D admittance 
 parser.add_argument("--num_envs", type=int, default=1, help="Number of environments (baseline uses 1).")
 parser.add_argument("--log", action="store_true", default=False, help="Enable CSV/video logging.")
 parser.add_argument("--record_length", type=int, default=0, help="If >0, stop after this many steps.")
-parser.add_argument("--soft", action="store_true", default=False, help="Use deformable wall instead of rigid wall.")
-parser.add_argument("--youngs_modulus", type=float, default=2e5, help="Young's modulus for deformable wall when --soft.")
 
 # Required baseline knobs
 parser.add_argument("--desired_contact_force", type=float, default=10.0, help="Desired normal force (N).")
 parser.add_argument("--admittance_M", type=float, default=2.0, help="Admittance virtual mass.")
 parser.add_argument("--admittance_B", type=float, default=220.0, help="Admittance virtual damping.")
-parser.add_argument("--admittance_K", type=float, default=150.0, help="Admittance virtual stiffness.")
+parser.add_argument("--admittance_K", type=float, default=160.0, help="Admittance virtual stiffness.")
 parser.add_argument("--contact_force_threshold", type=float, default=1.0, help="Contact threshold (N).")
-parser.add_argument(
-    "--soft_contact_pos_err_threshold",
-    type=float,
-    default=0.008,
-    help="For --soft mode, latch contact when ||x_curr - x_goal_final|| is below this (m).",
-)
 parser.add_argument("--contact_confirm_steps", type=int, default=3, help="Consecutive threshold hits to latch contact.")
 parser.add_argument("--force_ramp_time", type=float, default=0.5, help="Ramp time (s) from 0 to desired force.")
 parser.add_argument("--force_filter_alpha", type=float, default=0.2, help="LPF alpha for measured force [0,1].")
@@ -64,9 +56,9 @@ parser.add_argument("--wall_penetration_depth", type=float, default=0.075, help=
 parser.add_argument("--waypoint_switch_pos_thresh", type=float, default=0.008, help="Waypoint switch threshold (m).")
 parser.add_argument("--waypoint_hold_steps", type=int, default=15, help="Consecutive waypoint-hold steps.")
 parser.add_argument("--enable_waypoint", action="store_true", default=True, help="Enable pre-contact waypoint stage.")
-parser.add_argument("--non_contact_hold_gain", type=float, default=4.0, help="Gain for non-contact-axis hold.")
+parser.add_argument("--non_contact_hold_gain", type=float, default=2.0, help="Gain for non-contact-axis hold.")
 parser.add_argument(
-    "--max_non_contact_correction", type=float, default=0.03, help="Per-axis clamp for non-contact correction (m)."
+    "--max_non_contact_correction", type=float, default=0.01, help="Per-axis clamp for non-contact correction (m)."
 )
 
 AppLauncher.add_app_launcher_args(parser)
@@ -86,14 +78,13 @@ simulation_app = app_launcher.app
 
 # Delayed imports after app launch
 # pylint: disable=wrong-import-position
-import carb  # noqa: E402
 import csv  # noqa: E402
 
 import imageio.v2 as imageio  # noqa: E402
 import torch  # noqa: E402
 
 import isaaclab.sim as sim_utils  # noqa: E402
-from isaaclab.assets import Articulation, AssetBaseCfg, DeformableObject, DeformableObjectCfg  # noqa: E402
+from isaaclab.assets import Articulation, AssetBaseCfg  # noqa: E402
 from isaaclab.controllers import DifferentialIKController, DifferentialIKControllerCfg  # noqa: E402
 from isaaclab.markers import VisualizationMarkers  # noqa: E402
 from isaaclab.markers.config import FRAME_MARKER_CFG  # noqa: E402
@@ -105,62 +96,26 @@ from isaaclab.utils.math import combine_frame_transforms, matrix_from_quat, quat
 from source.franka import FRANKA_3_HIGH_PD_CFG  # noqa: E402
 
 
-def _enable_fractional_cutout_opacity():
-    """Enable RTX fractional cutout opacity using type-safe settings write."""
-    carb_settings = carb.settings.get_settings()
-    fractional_cutout_path = "/rtx/raytracing/fractionalCutoutOpacity"
-    current_val = carb_settings.get(fractional_cutout_path)
-
-    if isinstance(current_val, bool):
-        carb_settings.set_bool(fractional_cutout_path, True)
-    elif isinstance(current_val, int):
-        carb_settings.set_int(fractional_cutout_path, 1)
-    elif isinstance(current_val, float):
-        carb_settings.set_float(fractional_cutout_path, 1.0)
-    else:
-        carb_settings.set(fractional_cutout_path, 1)
-
-    print(f"[INFO] Enabled fractional cutout opacity via setting: {fractional_cutout_path}")
-
-
 @configclass
 class SceneCfg(InteractiveSceneCfg):
-    """Wall-contact baseline scene (rigid default, deformable with --soft)."""
+    """Rigid-wall baseline scene."""
 
     ground = AssetBaseCfg(prim_path="/World/defaultGroundPlane", spawn=sim_utils.GroundPlaneCfg())
     dome_light = AssetBaseCfg(
         prim_path="/World/Light", spawn=sim_utils.DomeLightCfg(intensity=3000.0, color=(0.75, 0.75, 0.75))
     )
 
-    if args_cli.soft:
-        soft_wall = DeformableObjectCfg(
-            prim_path="{ENV_REGEX_NS}/SoftWall",
-            spawn=sim_utils.MeshCuboidCfg(
-                size=(0.06, 0.8, 0.8),
-                deformable_props=sim_utils.DeformableBodyPropertiesCfg(rest_offset=0.0, contact_offset=0.005),
-                visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.5, 0.1, 0.0), opacity=0.5),
-                physics_material=sim_utils.DeformableBodyMaterialCfg(
-                    density=5000.0,
-                    youngs_modulus=args_cli.youngs_modulus,
-                    poissons_ratio=0.45,
-                    dynamic_friction=0.7,
-                ),
-                physics_material_path="material",
-            ),
-            init_state=DeformableObjectCfg.InitialStateCfg(pos=(0.50, -0.3, 0.85), rot=(1.0, 0.0, 0.0, 0.0)),
-        )
-    else:
-        rigid_wall = AssetBaseCfg(
-            prim_path="{ENV_REGEX_NS}/RigidWall",
-            spawn=sim_utils.CuboidCfg(
-                size=(0.06, 0.8, 0.8),
-                collision_props=sim_utils.CollisionPropertiesCfg(contact_offset=0.005, rest_offset=0.0),
-                rigid_props=sim_utils.RigidBodyPropertiesCfg(kinematic_enabled=True, disable_gravity=True),
-                visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.5, 0.1, 0.0), opacity=1.0),
-                physics_material=sim_utils.RigidBodyMaterialCfg(static_friction=0.9, dynamic_friction=0.7, restitution=0.0),
-            ),
-            init_state=AssetBaseCfg.InitialStateCfg(pos=(0.50, -0.3, 0.85), rot=(1.0, 0.0, 0.0, 0.0)),
-        )
+    rigid_wall = AssetBaseCfg(
+        prim_path="{ENV_REGEX_NS}/RigidWall",
+        spawn=sim_utils.CuboidCfg(
+            size=(0.06, 0.8, 0.8),
+            collision_props=sim_utils.CollisionPropertiesCfg(contact_offset=0.005, rest_offset=0.0),
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(kinematic_enabled=True, disable_gravity=True),
+            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.5, 0.1, 0.0), opacity=1.0),
+            physics_material=sim_utils.RigidBodyMaterialCfg(static_friction=0.9, dynamic_friction=0.7, restitution=0.0),
+        ),
+        init_state=AssetBaseCfg.InitialStateCfg(pos=(0.50, -0.3, 0.85), rot=(1.0, 0.0, 0.0, 0.0)),
+    )
 
     robot = FRANKA_3_HIGH_PD_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
     robot.actuators["franka_shoulder"].stiffness = 500.0
@@ -182,61 +137,6 @@ class SceneCfg(InteractiveSceneCfg):
             clipping_range=(0.1, 1.0e5),
         ),
     )
-
-
-def _find_block_eight_corner_vertex_ids(
-    nodal_pos_w: torch.Tensor,
-    block_center_b: torch.Tensor,
-    block_quat_b: torch.Tensor,
-    block_size_xyz: tuple[float, float, float],
-) -> torch.Tensor:
-    """Find unique closest simulation vertices to all 8 cuboid corners."""
-    block_rot_mat_b = matrix_from_quat(block_quat_b.unsqueeze(0)).squeeze(0)
-    nodal_pos_local = torch.matmul((nodal_pos_w - block_center_b).to(block_rot_mat_b.dtype), block_rot_mat_b)
-
-    hx = 0.5 * block_size_xyz[0]
-    hy = 0.5 * block_size_xyz[1]
-    hz = 0.5 * block_size_xyz[2]
-    corner_targets_local = torch.tensor(
-        [
-            [hx, hy, hz],
-            [hx, hy, -hz],
-            [hx, -hy, hz],
-            [hx, -hy, -hz],
-            [-hx, hy, hz],
-            [-hx, hy, -hz],
-            [-hx, -hy, hz],
-            [-hx, -hy, -hz],
-        ],
-        device=nodal_pos_w.device,
-        dtype=nodal_pos_w.dtype,
-    )
-    distances = torch.sum((nodal_pos_local.unsqueeze(2) - corner_targets_local.unsqueeze(0).unsqueeze(0)) ** 2, dim=-1)
-    num_envs, num_vertices, _ = distances.shape
-    corner_vertex_ids = torch.empty((num_envs, 8), dtype=torch.long, device=nodal_pos_w.device)
-    for env_id in range(num_envs):
-        d = distances[env_id].clone()
-        assigned_vertices: set[int] = set()
-        assigned_corners: set[int] = set()
-        for _ in range(8):
-            best_val = None
-            best_v = -1
-            best_c = -1
-            for c in range(8):
-                if c in assigned_corners:
-                    continue
-                for v in range(num_vertices):
-                    if v in assigned_vertices:
-                        continue
-                    val = d[v, c].item()
-                    if best_val is None or val < best_val:
-                        best_val = val
-                        best_v = v
-                        best_c = c
-            assigned_vertices.add(best_v)
-            assigned_corners.add(best_c)
-            corner_vertex_ids[env_id, best_c] = best_v
-    return corner_vertex_ids
 
 
 def update_states(robot: Articulation, ee_frame_idx: int, arm_joint_ids: list[int]):
@@ -265,7 +165,6 @@ def update_states(robot: Articulation, ee_frame_idx: int, arm_joint_ids: list[in
 def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
     robot = scene["robot"]
     observer_camera = scene["observer_camera"]
-    soft_wall: DeformableObject | None = scene["soft_wall"] if args_cli.soft else None
 
     ee_frame_name = "fr3_leftfinger"
     arm_joint_names = ["fr3_joint.*"]
@@ -294,7 +193,7 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
     ft_log_path = None
     run_dir = None
     if args_cli.log:
-        logs_root = REPO_ROOT / "logs" / ("admittance_baseline_soft" if args_cli.soft else "admittance_baseline_rigid")
+        logs_root = REPO_ROOT / "logs" / "admittance_baseline_rigid"
         logs_root.mkdir(parents=True, exist_ok=True)
         run_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
         run_dir = logs_root / run_tag
@@ -306,7 +205,6 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
             [
                 "wall_time_iso",
                 "step",
-                "youngs_modulus_pa",
                 "ee_pos_b_x",
                 "ee_pos_b_y",
                 "ee_pos_b_z",
@@ -348,7 +246,7 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
     ee_marker = VisualizationMarkers(frame_marker_cfg.replace(prim_path="/Visuals/ee_current"))
     goal_marker = VisualizationMarkers(frame_marker_cfg.replace(prim_path="/Visuals/ee_goal"))
 
-    # Wall geometry in root/body frame (matches SceneCfg)
+    # Rigid wall geometry in root/body frame (matches SceneCfg)
     wall_center_b = torch.tensor([0.50, -0.3, 0.85], device=sim.device)
     wall_quat_b = torch.tensor([1.0, 0.0, 0.0, 0.0], device=sim.device)
     wall_thickness = 0.06
@@ -362,41 +260,9 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
     contact_axis_b = -wall_normal_out_b
     wall_surface_center_b = wall_center_b + 0.5 * wall_thickness * wall_normal_out_b
 
-    # Optional deformable wall anchoring for stable soft-wall interaction.
-    wall_nodal_kinematic_target = None
-    if args_cli.soft and soft_wall is not None:
-        block_size_xyz = (0.06, 0.8, 0.8)
-        wall_nodal_kinematic_target = soft_wall.data.nodal_kinematic_target.clone()
-
-        block_corner_vertex_ids = _find_block_eight_corner_vertex_ids(
-            nodal_pos_w=soft_wall.data.default_nodal_state_w[..., :3],
-            block_center_b=wall_center_b,
-            block_quat_b=wall_quat_b,
-            block_size_xyz=block_size_xyz,
-        )
-
-        wall_nodal_state = soft_wall.data.default_nodal_state_w.clone()
-
-        # Set target positions to default positions
-        wall_nodal_kinematic_target[..., :3] = wall_nodal_state[..., :3]
-
-        # Make all nodes dynamic/free first
-        wall_nodal_kinematic_target[..., 3] = 0.0
-
-        # Pin only the 8 corner vertices
-        env_ids = torch.arange(scene.num_envs, device=sim.device)
-        for i in range(8):
-            vertex_ids = block_corner_vertex_ids[:, i]
-            wall_nodal_kinematic_target[env_ids, vertex_ids, :3] = wall_nodal_state[env_ids, vertex_ids, :3]
-            wall_nodal_kinematic_target[env_ids, vertex_ids, 3] = 1.0
-
-        soft_wall.write_nodal_kinematic_target_to_sim(wall_nodal_kinematic_target)
-        soft_wall.write_data_to_sim()
-
     # Goal set (3 y-locations), fixed orientation.
     wall_plane_offsets_yz = torch.tensor([[0.10, 0.0], [0.0, 0.0], [-0.10, 0.0]], device=sim.device)
-    effective_wall_penetration_depth = args_cli.wall_penetration_depth + (0.01 if args_cli.soft else 0.0)
-    wall_contact_center_b = wall_surface_center_b + effective_wall_penetration_depth * contact_axis_b
+    wall_contact_center_b = wall_surface_center_b + args_cli.wall_penetration_depth * contact_axis_b
     ee_goal_pos_set_b = (
         wall_contact_center_b.unsqueeze(0)
         + wall_plane_offsets_yz[:, 0:1] * wall_y_axis_b.unsqueeze(0)
@@ -495,13 +361,7 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
 
                 # Contact detection only during final-goal approach and after delay.
                 if (not moving_to_waypoint) and (steps_since_reset >= args_cli.contact_detection_delay_steps):
-                    if args_cli.soft:
-                        final_goal_pos_err = torch.norm(
-                            ee_pose_b[:, 0:3] - ee_goal_pose_set_b[active_goal_idx, 0:3].unsqueeze(0), dim=-1
-                        )
-                        over_thresh = final_goal_pos_err < args_cli.soft_contact_pos_err_threshold
-                    else:
-                        over_thresh = force_filt_n > args_cli.contact_force_threshold
+                    over_thresh = force_filt_n > args_cli.contact_force_threshold
                     contact_confirm_counter = torch.where(
                         over_thresh, contact_confirm_counter + 1, torch.zeros_like(contact_confirm_counter)
                     )
@@ -614,9 +474,6 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
             # Apply command
             robot.set_joint_position_target(joint_pos_des, joint_ids=arm_joint_ids)
             robot.write_data_to_sim()
-            if args_cli.soft and soft_wall is not None and wall_nodal_kinematic_target is not None:
-                soft_wall.write_nodal_kinematic_target_to_sim(wall_nodal_kinematic_target)
-                soft_wall.write_data_to_sim()
 
             ee_marker.visualize(ee_pose_w[:, 0:3], ee_pose_w[:, 3:7])
             goal_marker.visualize(ee_target_pose_w[:, 0:3], ee_target_pose_w[:, 3:7])
@@ -637,7 +494,6 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
                     [
                         datetime.now().isoformat(),
                         count,
-                        float(args_cli.youngs_modulus) if args_cli.soft else float("nan"),
                         ee_pos_b_env0[0],
                         ee_pos_b_env0[1],
                         ee_pos_b_env0[2],
@@ -687,11 +543,8 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
 
 
 def main():
-    # Enable translucency through RenderCfg.
-    render_cfg = sim_utils.RenderCfg(enable_translucency=True)
-    sim_cfg = sim_utils.SimulationCfg(dt=0.01, device=args_cli.device, render=render_cfg)
+    sim_cfg = sim_utils.SimulationCfg(dt=0.01, device=args_cli.device)
     sim = sim_utils.SimulationContext(sim_cfg)
-    _enable_fractional_cutout_opacity()
 
     scene_cfg = SceneCfg(num_envs=args_cli.num_envs, env_spacing=2.0)
     scene = InteractiveScene(scene_cfg)
