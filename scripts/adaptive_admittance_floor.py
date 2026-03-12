@@ -51,7 +51,7 @@ parser.add_argument(
     help="Environment mode: rigid wall, deformable soft wall, or rigid wall with compliant contact.",
 )
 parser.add_argument("--soft", action="store_true", default=False, help=argparse.SUPPRESS)
-parser.add_argument("--youngs_modulus", type=float, default=2e5, help="Young's modulus for deformable wall in --mode soft.")
+parser.add_argument("--youngs_modulus", type=float, default=5e3, help="Young's modulus for deformable wall in --mode soft.")
 parser.add_argument(
     "--compliant_contact_stiffness",
     type=float,
@@ -66,10 +66,32 @@ parser.add_argument(
 )
 
 # Required baseline knobs
-parser.add_argument("--desired_contact_force", type=float, default=10.0, help="Desired normal force (N).")
+parser.add_argument("--desired_contact_force", type=float, default=5.0, help="Desired normal force (N).")
 parser.add_argument("--admittance_M", type=float, default=1.0, help="Admittance virtual mass.")
 parser.add_argument("--admittance_B", type=float, default=160.0, help="Admittance virtual damping.")
 parser.add_argument("--admittance_K", type=float, default=100.0, help="Admittance virtual stiffness.")
+parser.add_argument(
+    "--enable_adaptive_K",
+    action="store_true",
+    default=False,
+    help="Enable adaptive admittance stiffness tuning from online environment stiffness estimate.",
+)
+parser.add_argument("--adaptive_K_alpha", type=float, default=0.2, help="Scale factor from k_env_hat to K_adapt.")
+parser.add_argument("--adaptive_K_beta", type=float, default=0.1, help="LPF coefficient for environment stiffness estimate.")
+parser.add_argument("--adaptive_K_min", type=float, default=10.0, help="Minimum adaptive admittance stiffness (N/m).")
+parser.add_argument("--adaptive_K_max", type=float, default=500.0, help="Maximum adaptive admittance stiffness (N/m).")
+parser.add_argument(
+    "--adaptive_K_dx_threshold",
+    type=float,
+    default=1e-4,
+    help="Minimum |dx| (m) required to update instantaneous environment stiffness estimate.",
+)
+parser.add_argument(
+    "--adaptive_K_df_threshold",
+    type=float,
+    default=0.05,
+    help="Minimum |dF| (N) required to update instantaneous environment stiffness estimate.",
+)
 parser.add_argument("--contact_force_threshold", type=float, default=1.0, help="Contact threshold (N).")
 parser.add_argument(
     "--soft_contact_pos_err_threshold",
@@ -115,8 +137,8 @@ parser.add_argument(
 
 # Waypoint / robustness helpers
 parser.add_argument("--contact_detection_delay_steps", type=int, default=20, help="Delay before contact detection after reset.")
-parser.add_argument("--waypoint_offset", type=float, default=0.015, help="Waypoint retreat along -contact-axis (m).")
-parser.add_argument("--wall_penetration_depth", type=float, default=0.075, help="Final goal penetration depth into wall along contact axis (m).")
+parser.add_argument("--waypoint_offset", type=float, default=0.01, help="Waypoint retreat along -contact-axis (m).")
+parser.add_argument("--wall_penetration_depth", type=float, default=0.0, help="Final goal penetration depth into wall along contact axis (m).")
 parser.add_argument("--waypoint_switch_pos_thresh", type=float, default=0.008, help="Waypoint switch threshold (m).")
 parser.add_argument("--waypoint_hold_steps", type=int, default=15, help="Consecutive waypoint-hold steps.")
 parser.add_argument("--enable_waypoint", action="store_true", default=True, help="Enable pre-contact waypoint stage.")
@@ -168,9 +190,10 @@ from isaaclab.utils.math import combine_frame_transforms, matrix_from_quat, quat
 from source.franka import FRANKA_3_HIGH_PD_CFG  # noqa: E402
 
 
-SOFT_WALL_INIT_POS = (0.50, -0.1, 0.85)
+SOFT_WALL_INIT_POS = (0.50, -0.1, 0.03)
+SOFT_WALL_INIT_ROT = (0.70710678, 0.0, -0.70710678, 0.0)
 RIGID_WALL_INIT_POS = (0.50, -0.3, 0.85)
-WALL_INIT_ROT = (1.0, 0.0, 0.0, 0.0)
+RIGID_WALL_INIT_ROT = (1.0, 0.0, 0.0, 0.0)
 
 
 def _enable_fractional_cutout_opacity():
@@ -217,7 +240,7 @@ class SceneCfg(InteractiveSceneCfg):
                 ),
                 physics_material_path="material",
             ),
-            init_state=DeformableObjectCfg.InitialStateCfg(pos=SOFT_WALL_INIT_POS, rot=WALL_INIT_ROT),
+            init_state=DeformableObjectCfg.InitialStateCfg(pos=SOFT_WALL_INIT_POS, rot=SOFT_WALL_INIT_ROT),
         )
     elif args_cli.mode == "compliant":
         # Rigid wall with compliant contact parameters for stiffness/damping sweeps.
@@ -237,7 +260,7 @@ class SceneCfg(InteractiveSceneCfg):
                     compliant_contact_damping=args_cli.compliant_contact_damping,
                 ),
             ),
-            init_state=AssetBaseCfg.InitialStateCfg(pos=RIGID_WALL_INIT_POS, rot=WALL_INIT_ROT),
+            init_state=AssetBaseCfg.InitialStateCfg(pos=RIGID_WALL_INIT_POS, rot=RIGID_WALL_INIT_ROT),
         )
     else:
         # Default rigid wall mode.
@@ -250,14 +273,14 @@ class SceneCfg(InteractiveSceneCfg):
                 visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.5, 0.1, 0.0), opacity=1.0),
                 physics_material=sim_utils.RigidBodyMaterialCfg(static_friction=0.9, dynamic_friction=0.7, restitution=0.0),
             ),
-            init_state=AssetBaseCfg.InitialStateCfg(pos=RIGID_WALL_INIT_POS, rot=WALL_INIT_ROT),
+            init_state=AssetBaseCfg.InitialStateCfg(pos=RIGID_WALL_INIT_POS, rot=RIGID_WALL_INIT_ROT),
         )
 
     robot = FRANKA_3_HIGH_PD_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
-    robot.actuators["franka_shoulder"].stiffness = 800.0
-    robot.actuators["franka_shoulder"].damping = 100.0
-    robot.actuators["franka_forearm"].stiffness = 800.0
-    robot.actuators["franka_forearm"].damping = 100.0
+    robot.actuators["franka_shoulder"].stiffness = 400.0
+    robot.actuators["franka_shoulder"].damping = 80.0
+    robot.actuators["franka_forearm"].stiffness = 400.0
+    robot.actuators["franka_forearm"].damping = 80.0
     robot.spawn.rigid_props.disable_gravity = True
 
     observer_camera = CameraCfg(
@@ -367,8 +390,8 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
     env_origins = scene.env_origins
 
     # Observer camera + main camera matching viewpoint.
-    camera_positions = env_origins + torch.tensor([-0.25, 1.8, 1.55], device=sim.device, dtype=env_origins.dtype)
-    camera_targets = env_origins + torch.tensor([0.38, 0.0, 0.86], device=sim.device, dtype=env_origins.dtype)
+    camera_positions = env_origins + torch.tensor([0.7, 0.8, 0.7], device=sim.device, dtype=env_origins.dtype)
+    camera_targets = env_origins + torch.tensor([0.5, -0.1, 0.0], device=sim.device, dtype=env_origins.dtype)
     observer_camera.set_world_poses_from_view(camera_positions, camera_targets)
 
     # Force sensing body
@@ -387,7 +410,7 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
     ft_log_path = None
     run_dir = None
     if args_cli.log:
-        logs_root = REPO_ROOT / "logs" / f"admittance_baseline_{args_cli.mode}"
+        logs_root = REPO_ROOT / "logs" / f"adaptive_admittance_floor_{args_cli.mode}"
         logs_root.mkdir(parents=True, exist_ok=True)
         run_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
         run_dir = logs_root / run_tag
@@ -413,11 +436,16 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
                 "x_cmd_b_y",
                 "x_cmd_b_z",
                 "x_n",
-                "fz",
-                "f_ext_n_raw",
-                "f_ext_n_filt",
+                "f_world_z_raw",
+                "f_contact_axis_raw",
+                "f_contact_axis_filt",
+                "f_compression_pos_raw",
+                "f_compression_pos_filt",
                 "f_des_n",
                 "f_err_n",
+                "k_env_inst",
+                "k_env_hat",
+                "K_used",
                 "admittance_offset",
                 "admittance_velocity",
                 "admittance_acceleration",
@@ -455,7 +483,7 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
     video_writer = None
     video_path = None
     if args_cli.log and run_dir is not None and args_cli.record is not None:
-        video_path = run_dir / "admittance_baseline_env0.mp4"
+        video_path = run_dir / "admittance_baseline_floor_env0.mp4"
         fps = max(1, int(round(1.0 / sim.get_physics_dt())))
         video_writer = imageio.get_writer(video_path, fps=fps)
 
@@ -472,54 +500,36 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
     # Wall geometry in root/body frame (matches SceneCfg)
     wall_init_pos = SOFT_WALL_INIT_POS if is_soft_mode else RIGID_WALL_INIT_POS
     wall_center_b = torch.tensor(wall_init_pos, device=sim.device)
-    wall_quat_b = torch.tensor(WALL_INIT_ROT, device=sim.device)
+    wall_init_rot = SOFT_WALL_INIT_ROT if is_soft_mode else RIGID_WALL_INIT_ROT
+    wall_quat_b = torch.tensor(wall_init_rot, device=sim.device)
     wall_thickness = 0.06
     wall_rot_mat_b = matrix_from_quat(wall_quat_b.unsqueeze(0)).squeeze(0)
     wall_x_axis_b = wall_rot_mat_b[:, 0]
     wall_y_axis_b = wall_rot_mat_b[:, 1]
     wall_z_axis_b = wall_rot_mat_b[:, 2]
 
-    # Near-side face normal points from wall to robot (-X). Compression axis into wall is +X.
-    wall_normal_out_b = -wall_x_axis_b
-    contact_axis_b = -wall_normal_out_b
+    # Contact axis convention by mode:
+    # - rigid/compliant: near-side normal is -X, compression axis is +X
+    # - soft: force contact axis to world -Z so positive admittance offset presses downward
+    world_z_axis = torch.tensor([0.0, 0.0, 1.0], device=sim.device)
+    if is_soft_mode:
+        wall_normal_out_b = world_z_axis
+        contact_axis_b = -world_z_axis
+    else:
+        wall_normal_out_b = -wall_x_axis_b
+        contact_axis_b = -wall_normal_out_b
     wall_surface_center_b = wall_center_b + 0.5 * wall_thickness * wall_normal_out_b
 
-    # Optional deformable wall anchoring for stable soft-wall interaction.
+    # Soft mode uses floor support, so keep all deformable nodes free (no nodal constraints).
     wall_nodal_kinematic_target = None
-    if is_soft_mode and soft_wall is not None:
-        block_size_xyz = (0.06, 0.8, 0.8)
-        wall_nodal_kinematic_target = soft_wall.data.nodal_kinematic_target.clone()
 
-        block_corner_vertex_ids = _find_block_eight_corner_vertex_ids(
-            nodal_pos_w=soft_wall.data.default_nodal_state_w[..., :3],
-            block_center_b=wall_center_b,
-            block_quat_b=wall_quat_b,
-            block_size_xyz=block_size_xyz,
-        )
-
-        wall_nodal_kinematic_target = soft_wall.data.nodal_kinematic_target.clone()
-        wall_nodal_state = soft_wall.data.default_nodal_state_w.clone()
-
-        # Set target positions to current/default positions
-        wall_nodal_kinematic_target[..., :3] = wall_nodal_state[..., :3]
-
-        # First make ALL nodes free
-        wall_nodal_kinematic_target[..., 3] = 1.0
-
-        # Constrain only the 4 top-face corners; keep bottom corners free.
-        # Corner indices with +hz in _find_block_eight_corner_vertex_ids() are: 0, 2, 4, 6.
-        top_corner_indices = (0, 2, 4, 6)
-        env_ids = torch.arange(scene.num_envs, device=sim.device)
-        for i in top_corner_indices:
-            vertex_ids = block_corner_vertex_ids[:, i]
-            wall_nodal_kinematic_target[env_ids, vertex_ids, :3] = wall_nodal_state[env_ids, vertex_ids, :3]
-            wall_nodal_kinematic_target[env_ids, vertex_ids, 3] = 0.0
-
-        soft_wall.write_nodal_kinematic_target_to_sim(wall_nodal_kinematic_target)
-        soft_wall.write_data_to_sim()
-
-    # Goal set (3 y-locations), fixed orientation.
-    wall_plane_offsets_yz = torch.tensor([[0.10, 0.0], [0.0, 0.0], [-0.10, 0.0]], device=sim.device)
+    # Goal set:
+    # - soft mode: center point plus two points in +Y
+    # - rigid/compliant: three lateral points
+    if is_soft_mode:
+        wall_plane_offsets_yz = torch.tensor([[0.0, 0.0], [0.10, 0.0], [0.20, 0.0]], device=sim.device)
+    else:
+        wall_plane_offsets_yz = torch.tensor([[0.10, 0.0], [0.0, 0.0], [-0.10, 0.0]], device=sim.device)
     effective_wall_penetration_depth = args_cli.wall_penetration_depth
     wall_contact_center_b = wall_surface_center_b + effective_wall_penetration_depth * contact_axis_b
     ee_goal_pos_set_b = (
@@ -527,14 +537,24 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
         + wall_plane_offsets_yz[:, 0:1] * wall_y_axis_b.unsqueeze(0)
         + wall_plane_offsets_yz[:, 1:2] * wall_z_axis_b.unsqueeze(0)
     )
-    # Baseline experiment requirement: keep nominal contact x target fixed.
-    ee_goal_pos_set_b[:, 0] = 0.5138
-    ee_goal_quat_set_b = torch.tensor([0.0, 0.70710678, 0.0, 0.70710678], device=sim.device).repeat(3, 1)
+    if is_soft_mode:
+        # Floor-contact soft mode: keep nominal goal slightly above the top surface to account for finger-frame offset.
+        ee_goal_pos_set_b[:, 2] = 0.116
+    # Keep fixed X target only for vertical-wall modes.
+    if not is_soft_mode:
+        ee_goal_pos_set_b[:, 0] = 0.5138
+    num_goal_points = ee_goal_pos_set_b.shape[0]
+    if is_soft_mode:
+        # Make EE local +Z (blue axis) point to world -Z.
+        ee_goal_quat_set_b = torch.tensor([0.0, 1.0, 0.0, 0.0], device=sim.device).repeat(num_goal_points, 1)
+    else:
+        ee_goal_quat_set_b = torch.tensor([0.0, 0.70710678, 0.0, 0.70710678], device=sim.device).repeat(
+            num_goal_points, 1
+        )
     ee_goal_pose_set_b = torch.cat([ee_goal_pos_set_b, ee_goal_quat_set_b], dim=-1)
 
-    # In soft mode, retreat waypoint further from the wall to avoid starting deep in deformable contact.
-    soft_waypoint_extra_offset = 0.03 if is_soft_mode else 0.0
-    effective_waypoint_offset = args_cli.waypoint_offset + soft_waypoint_extra_offset
+    # Waypoint retreat is controlled directly by --waypoint_offset.
+    effective_waypoint_offset = args_cli.waypoint_offset
     ee_waypoint_pos_set_b = ee_goal_pos_set_b - effective_waypoint_offset * contact_axis_b.unsqueeze(0)
     ee_waypoint_pose_set_b = torch.cat([ee_waypoint_pos_set_b, ee_goal_quat_set_b], dim=-1)
 
@@ -555,7 +575,8 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
     contact_confirm_counter = torch.zeros(scene.num_envs, dtype=torch.long, device=sim.device)
     contact_latch_step = torch.full((scene.num_envs,), -1, dtype=torch.long, device=sim.device)
 
-    force_filt_n = torch.zeros(scene.num_envs, device=sim.device)
+    f_contact_axis_filt = torch.zeros(scene.num_envs, device=sim.device)
+    f_compression_pos_filt = torch.zeros(scene.num_envs, device=sim.device)
     admittance_offset = torch.zeros(scene.num_envs, device=sim.device)
     admittance_velocity = torch.zeros(scene.num_envs, device=sim.device)
     admittance_acceleration = torch.zeros(scene.num_envs, device=sim.device)
@@ -569,6 +590,12 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
     x_cmd_b = ee_pose_b[:, 0:3].clone()
     x_cmd_n = torch.zeros(scene.num_envs, device=sim.device)
     x_curr_n = torch.zeros(scene.num_envs, device=sim.device)
+    x_curr_n_prev_for_k = torch.zeros(scene.num_envs, device=sim.device)
+    f_comp_prev_for_k = torch.zeros(scene.num_envs, device=sim.device)
+    k_env_inst = torch.full((scene.num_envs,), float("nan"), device=sim.device)
+    k_env_hat = torch.zeros(scene.num_envs, device=sim.device)
+    k_env_valid = torch.zeros(scene.num_envs, dtype=torch.bool, device=sim.device)
+    K_used = torch.full((scene.num_envs,), args_cli.admittance_K, device=sim.device)
     tracking_error_n = torch.zeros(scene.num_envs, device=sim.device)
     tracking_error_n_prev = torch.zeros(scene.num_envs, device=sim.device)
     non_contact_correction_mag = torch.zeros(scene.num_envs, device=sim.device)
@@ -612,27 +639,46 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
                 prev_contact_active[:] = False
                 contact_confirm_counter.zero_()
                 contact_latch_step.fill_(-1)
-                force_filt_n.zero_()
+                f_contact_axis_filt.zero_()
+                f_compression_pos_filt.zero_()
                 admittance_offset.zero_()
                 admittance_velocity.zero_()
                 admittance_acceleration.zero_()
+                x_curr_n_prev_for_k.zero_()
+                f_comp_prev_for_k.zero_()
+                k_env_inst.fill_(float("nan"))
+                k_env_hat.zero_()
+                k_env_valid.zero_()
+                K_used.fill_(args_cli.admittance_K)
                 waypoint_hold_counter = 0
                 steps_since_reset = 0
             else:
                 jacobian_b, ee_pose_b, root_pose_w, ee_pose_w, joint_pos = update_states(robot, ee_frame_idx, arm_joint_ids)
 
-                # Measured normal force (robot-on-wall, compression positive)
+                # body_incoming_joint_wrench_b is a joint reaction wrench in a body-related frame.
+                # We explicitly derive world-Z, contact-axis projection, and compression-positive force.
                 if ft_body_idx is not None:
                     force_hand_b = robot.data.body_incoming_joint_wrench_b[:, ft_body_idx, 0:3]
                     hand_quat_w = robot.data.body_quat_w[:, ft_body_idx]
                     force_w = quat_apply(hand_quat_w, force_hand_b)
                     force_root_b = quat_apply_inverse(robot.data.root_quat_w, force_w)
-                    f_ext_n_raw = torch.sum(force_root_b * contact_axis_b.unsqueeze(0), dim=-1)
+                    f_world_z_raw = force_w[:, 2]
+                    f_contact_axis_raw = torch.sum(force_root_b * contact_axis_b.unsqueeze(0), dim=-1)
                 else:
-                    f_ext_n_raw = torch.zeros(scene.num_envs, device=sim.device)
+                    f_world_z_raw = torch.zeros(scene.num_envs, device=sim.device)
+                    f_contact_axis_raw = torch.zeros(scene.num_envs, device=sim.device)
 
                 # LPF: y_k = alpha*x_k + (1-alpha)*y_{k-1}
-                force_filt_n = args_cli.force_filter_alpha * f_ext_n_raw + (1.0 - args_cli.force_filter_alpha) * force_filt_n
+                f_contact_axis_filt = (
+                    args_cli.force_filter_alpha * f_contact_axis_raw + (1.0 - args_cli.force_filter_alpha) * f_contact_axis_filt
+                )
+
+                # Compression-positive force used by contact logic and admittance force error.
+                f_compression_pos_raw = -f_contact_axis_raw
+                f_compression_pos_filt = (
+                    args_cli.force_filter_alpha * f_compression_pos_raw
+                    + (1.0 - args_cli.force_filter_alpha) * f_compression_pos_filt
+                )
 
                 # Contact detection only during final-goal approach and after delay.
                 if (not moving_to_waypoint) and (steps_since_reset >= args_cli.contact_detection_delay_steps):
@@ -640,11 +686,11 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
                         final_goal_pos_err = torch.norm(
                             ee_pose_b[:, 0:3] - ee_goal_pose_set_b[active_goal_idx, 0:3].unsqueeze(0), dim=-1
                         )
-                        over_thresh = final_goal_pos_err < args_cli.soft_contact_pos_err_threshold
-                    elif is_compliant_mode:
-                        over_thresh = force_filt_n > args_cli.contact_force_threshold
+                        over_thresh_force = f_compression_pos_filt > args_cli.contact_force_threshold
+                        over_thresh_pos = final_goal_pos_err < args_cli.soft_contact_pos_err_threshold
+                        over_thresh = torch.logical_or(over_thresh_force, over_thresh_pos)
                     else:
-                        over_thresh = force_filt_n > args_cli.contact_force_threshold
+                        over_thresh = f_compression_pos_filt > args_cli.contact_force_threshold
                     contact_confirm_counter = torch.where(
                         over_thresh, contact_confirm_counter + 1, torch.zeros_like(contact_confirm_counter)
                     )
@@ -681,9 +727,12 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
                     ramp = torch.clamp(elapsed / args_cli.force_ramp_time, 0.0, 1.0)
                 else:
                     ramp = torch.ones(scene.num_envs, device=sim.device)
-                f_des_n = torch.where(contact_active, args_cli.desired_contact_force * ramp, torch.zeros_like(force_filt_n))
+                f_des_n = torch.where(
+                    contact_active, args_cli.desired_contact_force * ramp, torch.zeros_like(f_compression_pos_filt)
+                )
 
-                f_err_n = f_des_n - force_filt_n
+                # Desired-vs-measured force error in compression-positive convention.
+                f_err_n = f_des_n - f_compression_pos_filt
 
                 x_curr_b = ee_pose_b[:, 0:3]
                 x_nominal_b = ee_target_pose_b[:, 0:3]
@@ -691,6 +740,42 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
                 x_curr_n = torch.sum(x_delta_b * contact_axis_b.unsqueeze(0), dim=-1)
                 x_cmd_n_prev = torch.sum((x_cmd_prev_b - x_nominal_b) * contact_axis_b.unsqueeze(0), dim=-1)
                 tracking_error_n_prev = x_cmd_n_prev - x_curr_n
+
+                if args_cli.enable_adaptive_K:
+                    dx_for_k = x_curr_n - x_curr_n_prev_for_k
+                    dF_for_k = f_compression_pos_filt - f_comp_prev_for_k
+                    abs_dx = torch.abs(dx_for_k)
+                    abs_dF = torch.abs(dF_for_k)
+                    valid_update = torch.logical_and(
+                        contact_active,
+                        torch.logical_and(abs_dx > args_cli.adaptive_K_dx_threshold, abs_dF > args_cli.adaptive_K_df_threshold),
+                    )
+                    safe_dx = torch.where(abs_dx > 1.0e-9, dx_for_k, torch.ones_like(dx_for_k))
+                    k_env_inst_candidate = dF_for_k / safe_dx
+                    valid_inst = torch.logical_and(
+                        valid_update,
+                        torch.logical_and(torch.isfinite(k_env_inst_candidate), k_env_inst_candidate > 0.0),
+                    )
+                    k_env_inst_candidate = torch.clamp(k_env_inst_candidate, max=1.0e6)
+                    k_env_inst = torch.where(valid_inst, k_env_inst_candidate, k_env_inst)
+                    k_env_hat = torch.where(
+                        valid_inst,
+                        args_cli.adaptive_K_beta * k_env_inst_candidate + (1.0 - args_cli.adaptive_K_beta) * k_env_hat,
+                        k_env_hat,
+                    )
+                    k_env_valid = torch.logical_or(k_env_valid, valid_inst)
+                    K_adapt = args_cli.adaptive_K_alpha * k_env_hat
+                    K_adapt = torch.clamp(K_adapt, args_cli.adaptive_K_min, args_cli.adaptive_K_max)
+                    K_used = torch.where(
+                        torch.logical_and(contact_active, k_env_valid),
+                        K_adapt,
+                        torch.full_like(K_adapt, args_cli.admittance_K),
+                    )
+                else:
+                    K_used.fill_(args_cli.admittance_K)
+
+                x_curr_n_prev_for_k = x_curr_n.clone()
+                f_comp_prev_for_k = f_compression_pos_filt.clone()
 
                 # Optional anti-windup: integrate admittance only while Cartesian normal tracking is good.
                 admittance_integrate_enabled = contact_active.clone()
@@ -702,7 +787,7 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
                 # Admittance update (1D) with active clamps.
                 admittance_acceleration = torch.where(
                     admittance_integrate_enabled,
-                    (f_err_n - args_cli.admittance_B * admittance_velocity - args_cli.admittance_K * admittance_offset)
+                    (f_err_n - args_cli.admittance_B * admittance_velocity - K_used * admittance_offset)
                     / args_cli.admittance_M,
                     torch.zeros_like(admittance_acceleration),
                 )
@@ -734,11 +819,20 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
                     -args_cli.max_non_contact_correction,
                     args_cli.max_non_contact_correction,
                 )
+                if is_soft_mode:
+                    # Floor-contact mode: only allow corrective motion in XY.
+                    non_contact_correction_b = torch.cat(
+                        [non_contact_correction_b[:, 0:2], torch.zeros_like(non_contact_correction_b[:, 2:3])], dim=-1
+                    )
                 non_contact_correction_mag = torch.linalg.norm(non_contact_correction_b, dim=-1)
                 if not args_cli.disable_non_contact_correction:
                     x_cmd_b = torch.where(contact_active.unsqueeze(-1), x_cmd_b + non_contact_correction_b, x_cmd_b)
                 else:
                     non_contact_correction_mag = torch.zeros_like(non_contact_correction_mag)
+
+                if is_soft_mode:
+                    # Keep normal pressing strictly on world-Z in soft mode.
+                    x_cmd_b[:, 2] = x_nominal_b[:, 2] + contact_axis_b[2] * admittance_offset
 
                 # Reduce final pre-contact approach speed for stable contact onset.
                 x_cmd_step_clipped = torch.zeros_like(x_cmd_step_clipped)
@@ -770,9 +864,14 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
                         "[ADM] "
                         f"phase={phase} "
                         f"contact={bool(contact_active[0].item())} "
-                        f"Fext={float(force_filt_n[0].item()):.3f}N "
+                        f"FworldZ={float(f_world_z_raw[0].item()):.3f}N "
+                        f"Faxis={float(f_contact_axis_raw[0].item()):.3f}N "
+                        f"Fcomp={float(f_compression_pos_filt[0].item()):.3f}N "
                         f"Fdes={float(f_des_n[0].item()):.3f}N "
                         f"Ferr={float(f_err_n[0].item()):.3f}N "
+                        f"Kused={float(K_used[0].item()):.2f} "
+                        f"kenv_inst={float(k_env_inst[0].item()):.2f} "
+                        f"kenv_hat={float(k_env_hat[0].item()):.2f} "
                         f"x={float(admittance_offset[0].item()):.5f}m "
                         f"xcmd_n={float(x_cmd_n[0].item()):.5f}m "
                         f"xcurr_n={float(x_curr_n[0].item()):.5f}m "
@@ -828,11 +927,16 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
                         x_cmd_b_env0[1],
                         x_cmd_b_env0[2],
                         float(x_curr_n[0].item()) if "x_curr_n" in locals() else 0.0,
-                        float(force_filt_n[0].item()) if "force_filt_n" in locals() else 0.0,
-                        float(f_ext_n_raw[0].item()) if "f_ext_n_raw" in locals() else 0.0,
-                        float(force_filt_n[0].item()) if "force_filt_n" in locals() else 0.0,
+                        float(f_world_z_raw[0].item()) if "f_world_z_raw" in locals() else 0.0,
+                        float(f_contact_axis_raw[0].item()) if "f_contact_axis_raw" in locals() else 0.0,
+                        float(f_contact_axis_filt[0].item()) if "f_contact_axis_filt" in locals() else 0.0,
+                        float(f_compression_pos_raw[0].item()) if "f_compression_pos_raw" in locals() else 0.0,
+                        float(f_compression_pos_filt[0].item()) if "f_compression_pos_filt" in locals() else 0.0,
                         float(f_des_n[0].item()) if "f_des_n" in locals() else 0.0,
                         float(f_err_n[0].item()) if "f_err_n" in locals() else 0.0,
+                        float(k_env_inst[0].item()),
+                        float(k_env_hat[0].item()),
+                        float(K_used[0].item()),
                         float(admittance_offset[0].item()),
                         float(admittance_velocity[0].item()),
                         float(admittance_acceleration[0].item()),
@@ -885,7 +989,8 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
             plot_script = REPO_ROOT / "scripts" / "plot_data.py"
             if plot_script.exists():
                 print(f"[INFO] Generating plot from log: {ft_log_path}")
-                subprocess.run([sys.executable, str(plot_script), str(ft_log_path)], check=False)
+                plot_title = f"Adaptive Admittance Floor ({args_cli.mode})"
+                subprocess.run([sys.executable, str(plot_script), str(ft_log_path), "--title", plot_title], check=False)
 
 
 def main():
