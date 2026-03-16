@@ -168,10 +168,8 @@ from isaaclab.utils.math import combine_frame_transforms, matrix_from_quat, quat
 from source.franka import FRANKA_3_HIGH_PD_CFG  # noqa: E402
 
 
-SOFT_WALL_INIT_POS = (0.50, -0.1, 0.03)
-SOFT_WALL_INIT_ROT = (0.70710678, 0.0, -0.70710678, 0.0)
-RIGID_WALL_INIT_POS = (0.50, -0.3, 0.85)
-RIGID_WALL_INIT_ROT = (1.0, 0.0, 0.0, 0.0)
+FLOOR_WALL_INIT_POS = (0.50, -0.1, 0.03)
+FLOOR_WALL_INIT_ROT = (0.70710678, 0.0, -0.70710678, 0.0)
 
 
 def _enable_fractional_cutout_opacity():
@@ -218,7 +216,7 @@ class SceneCfg(InteractiveSceneCfg):
                 ),
                 physics_material_path="material",
             ),
-            init_state=DeformableObjectCfg.InitialStateCfg(pos=SOFT_WALL_INIT_POS, rot=SOFT_WALL_INIT_ROT),
+            init_state=DeformableObjectCfg.InitialStateCfg(pos=FLOOR_WALL_INIT_POS, rot=FLOOR_WALL_INIT_ROT),
         )
     elif args_cli.mode == "compliant":
         # Rigid wall with compliant contact parameters for stiffness/damping sweeps.
@@ -238,7 +236,7 @@ class SceneCfg(InteractiveSceneCfg):
                     compliant_contact_damping=args_cli.compliant_contact_damping,
                 ),
             ),
-            init_state=AssetBaseCfg.InitialStateCfg(pos=RIGID_WALL_INIT_POS, rot=RIGID_WALL_INIT_ROT),
+            init_state=AssetBaseCfg.InitialStateCfg(pos=FLOOR_WALL_INIT_POS, rot=FLOOR_WALL_INIT_ROT),
         )
     else:
         # Default rigid wall mode.
@@ -251,7 +249,7 @@ class SceneCfg(InteractiveSceneCfg):
                 visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.5, 0.1, 0.0), opacity=1.0),
                 physics_material=sim_utils.RigidBodyMaterialCfg(static_friction=0.9, dynamic_friction=0.7, restitution=0.0),
             ),
-            init_state=AssetBaseCfg.InitialStateCfg(pos=RIGID_WALL_INIT_POS, rot=RIGID_WALL_INIT_ROT),
+            init_state=AssetBaseCfg.InitialStateCfg(pos=FLOOR_WALL_INIT_POS, rot=FLOOR_WALL_INIT_ROT),
         )
 
     robot = FRANKA_3_HIGH_PD_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
@@ -473,38 +471,26 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
     goal_marker = VisualizationMarkers(frame_marker_cfg.replace(prim_path="/Visuals/ee_goal"))
 
     # Wall geometry in root/body frame (matches SceneCfg)
-    wall_init_pos = SOFT_WALL_INIT_POS if is_soft_mode else RIGID_WALL_INIT_POS
-    wall_center_b = torch.tensor(wall_init_pos, device=sim.device)
-    wall_init_rot = SOFT_WALL_INIT_ROT if is_soft_mode else RIGID_WALL_INIT_ROT
-    wall_quat_b = torch.tensor(wall_init_rot, device=sim.device)
+    # This floor controller uses the same wall pose/contact geometry for all modes.
+    # Only the wall material model changes between rigid, compliant, and soft.
+    wall_center_b = torch.tensor(FLOOR_WALL_INIT_POS, device=sim.device)
+    wall_quat_b = torch.tensor(FLOOR_WALL_INIT_ROT, device=sim.device)
     wall_thickness = 0.06
     wall_rot_mat_b = matrix_from_quat(wall_quat_b.unsqueeze(0)).squeeze(0)
-    wall_x_axis_b = wall_rot_mat_b[:, 0]
     wall_y_axis_b = wall_rot_mat_b[:, 1]
     wall_z_axis_b = wall_rot_mat_b[:, 2]
 
-    # Contact axis convention by mode:
-    # - rigid/compliant: near-side normal is -X, compression axis is +X
-    # - soft: force contact axis to world -Z so positive admittance offset presses downward
     world_z_axis = torch.tensor([0.0, 0.0, 1.0], device=sim.device)
-    if is_soft_mode:
-        wall_normal_out_b = world_z_axis
-        contact_axis_b = -world_z_axis
-    else:
-        wall_normal_out_b = -wall_x_axis_b
-        contact_axis_b = -wall_normal_out_b
+    wall_normal_out_b = world_z_axis
+    # Geometric contact axis stays downward so positive admittance offset presses into the floor.
+    contact_axis_b = -world_z_axis
     wall_surface_center_b = wall_center_b + 0.5 * wall_thickness * wall_normal_out_b
 
     # Soft mode uses floor support, so keep all deformable nodes free (no nodal constraints).
     wall_nodal_kinematic_target = None
 
-    # Goal set:
-    # - soft mode: center point plus two points in +Y
-    # - rigid/compliant: three lateral points
-    if is_soft_mode:
-        wall_plane_offsets_yz = torch.tensor([[0.0, 0.0], [0.10, 0.0], [0.20, 0.0]], device=sim.device)
-    else:
-        wall_plane_offsets_yz = torch.tensor([[0.10, 0.0], [0.0, 0.0], [-0.10, 0.0]], device=sim.device)
+    # Use the floor-contact target layout from soft mode for every wall mode.
+    wall_plane_offsets_yz = torch.tensor([[0.0, 0.0], [0.10, 0.0], [0.20, 0.0]], device=sim.device)
     effective_wall_penetration_depth = args_cli.wall_penetration_depth
     wall_contact_center_b = wall_surface_center_b + effective_wall_penetration_depth * contact_axis_b
     ee_goal_pos_set_b = (
@@ -512,20 +498,11 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
         + wall_plane_offsets_yz[:, 0:1] * wall_y_axis_b.unsqueeze(0)
         + wall_plane_offsets_yz[:, 1:2] * wall_z_axis_b.unsqueeze(0)
     )
-    if is_soft_mode:
-        # Floor-contact soft mode: keep nominal goal slightly above the top surface to account for finger-frame offset.
-        ee_goal_pos_set_b[:, 2] = 0.116
-    # Keep fixed X target only for vertical-wall modes.
-    if not is_soft_mode:
-        ee_goal_pos_set_b[:, 0] = 0.5138
+    # Keep nominal goals slightly above the top surface to account for the finger-frame offset.
+    ee_goal_pos_set_b[:, 2] = 0.116
     num_goal_points = ee_goal_pos_set_b.shape[0]
-    if is_soft_mode:
-        # Make EE local +Z (blue axis) point to world -Z.
-        ee_goal_quat_set_b = torch.tensor([0.0, 1.0, 0.0, 0.0], device=sim.device).repeat(num_goal_points, 1)
-    else:
-        ee_goal_quat_set_b = torch.tensor([0.0, 0.70710678, 0.0, 0.70710678], device=sim.device).repeat(
-            num_goal_points, 1
-        )
+    # Make EE local +Z (blue axis) point to world -Z.
+    ee_goal_quat_set_b = torch.tensor([0.0, 1.0, 0.0, 0.0], device=sim.device).repeat(num_goal_points, 1)
     ee_goal_pose_set_b = torch.cat([ee_goal_pos_set_b, ee_goal_quat_set_b], dim=-1)
 
     # Waypoint retreat is controlled directly by --waypoint_offset.
@@ -637,7 +614,8 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
                 )
 
                 # Compression-positive force used by contact logic and admittance force error.
-                f_compression_pos_raw = -f_contact_axis_raw
+                # Soft mode and rigid/compliant modes expose opposite wrench signs here.
+                f_compression_pos_raw = -f_contact_axis_raw if is_soft_mode else f_contact_axis_raw
                 f_compression_pos_filt = (
                     args_cli.force_filter_alpha * f_compression_pos_raw
                     + (1.0 - args_cli.force_filter_alpha) * f_compression_pos_filt
@@ -645,15 +623,12 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
 
                 # Contact detection only during final-goal approach and after delay.
                 if (not moving_to_waypoint) and (steps_since_reset >= args_cli.contact_detection_delay_steps):
-                    if is_soft_mode:
-                        final_goal_pos_err = torch.norm(
-                            ee_pose_b[:, 0:3] - ee_goal_pose_set_b[active_goal_idx, 0:3].unsqueeze(0), dim=-1
-                        )
-                        over_thresh_force = f_compression_pos_filt > args_cli.contact_force_threshold
-                        over_thresh_pos = final_goal_pos_err < args_cli.soft_contact_pos_err_threshold
-                        over_thresh = torch.logical_or(over_thresh_force, over_thresh_pos)
-                    else:
-                        over_thresh = f_compression_pos_filt > args_cli.contact_force_threshold
+                    final_goal_pos_err = torch.norm(
+                        ee_pose_b[:, 0:3] - ee_goal_pose_set_b[active_goal_idx, 0:3].unsqueeze(0), dim=-1
+                    )
+                    over_thresh_force = f_compression_pos_filt > args_cli.contact_force_threshold
+                    over_thresh_pos = final_goal_pos_err < args_cli.soft_contact_pos_err_threshold
+                    over_thresh = torch.logical_or(over_thresh_force, over_thresh_pos)
                     contact_confirm_counter = torch.where(
                         over_thresh, contact_confirm_counter + 1, torch.zeros_like(contact_confirm_counter)
                     )
@@ -663,12 +638,8 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
 
                 # Waypoint -> final goal transition
                 if moving_to_waypoint and (not torch.any(contact_active)):
-                    if is_soft_mode:
-                        # In soft mode, use normal-axis waypoint error to avoid Y/Z contact-induced bias.
-                        waypoint_delta_b = ee_pose_b[:, 0:3] - ee_target_pose_b[:, 0:3]
-                        waypoint_pos_err = torch.abs(torch.sum(waypoint_delta_b * contact_axis_b.unsqueeze(0), dim=-1))
-                    else:
-                        waypoint_pos_err = torch.norm(ee_pose_b[:, 0:3] - ee_target_pose_b[:, 0:3], dim=-1)
+                    waypoint_delta_b = ee_pose_b[:, 0:3] - ee_target_pose_b[:, 0:3]
+                    waypoint_pos_err = torch.abs(torch.sum(waypoint_delta_b * contact_axis_b.unsqueeze(0), dim=-1))
                     if torch.all(waypoint_pos_err < args_cli.waypoint_switch_pos_thresh):
                         waypoint_hold_counter += 1
                     else:
@@ -746,20 +717,18 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
                     -args_cli.max_non_contact_correction,
                     args_cli.max_non_contact_correction,
                 )
-                if is_soft_mode:
-                    # Floor-contact mode: only allow corrective motion in XY.
-                    non_contact_correction_b = torch.cat(
-                        [non_contact_correction_b[:, 0:2], torch.zeros_like(non_contact_correction_b[:, 2:3])], dim=-1
-                    )
+                # Floor-contact mode: only allow corrective motion in XY.
+                non_contact_correction_b = torch.cat(
+                    [non_contact_correction_b[:, 0:2], torch.zeros_like(non_contact_correction_b[:, 2:3])], dim=-1
+                )
                 non_contact_correction_mag = torch.linalg.norm(non_contact_correction_b, dim=-1)
                 if not args_cli.disable_non_contact_correction:
                     x_cmd_b = torch.where(contact_active.unsqueeze(-1), x_cmd_b + non_contact_correction_b, x_cmd_b)
                 else:
                     non_contact_correction_mag = torch.zeros_like(non_contact_correction_mag)
 
-                if is_soft_mode:
-                    # Keep normal pressing strictly on world-Z in soft mode.
-                    x_cmd_b[:, 2] = x_nominal_b[:, 2] + contact_axis_b[2] * admittance_offset
+                # Keep normal pressing strictly on world-Z for all floor-contact modes.
+                x_cmd_b[:, 2] = x_nominal_b[:, 2] + contact_axis_b[2] * admittance_offset
 
                 # Reduce final pre-contact approach speed for stable contact onset.
                 x_cmd_step_clipped = torch.zeros_like(x_cmd_step_clipped)
