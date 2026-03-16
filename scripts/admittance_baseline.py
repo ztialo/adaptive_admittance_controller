@@ -51,7 +51,7 @@ parser.add_argument(
     help="Environment mode: rigid wall, deformable soft wall, or rigid wall with compliant contact.",
 )
 parser.add_argument("--soft", action="store_true", default=False, help=argparse.SUPPRESS)
-parser.add_argument("--youngs_modulus", type=float, default=2e5, help="Young's modulus for deformable wall in --mode soft.")
+parser.add_argument("--youngs_modulus", type=float, default=5e3, help="Young's modulus for deformable wall in --mode soft.")
 parser.add_argument(
     "--compliant_contact_stiffness",
     type=float,
@@ -506,11 +506,10 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
         # First make ALL nodes free
         wall_nodal_kinematic_target[..., 3] = 1.0
 
-        # Constrain only the 4 top-face corners; keep bottom corners free.
-        # Corner indices with +hz in _find_block_eight_corner_vertex_ids() are: 0, 2, 4, 6.
-        top_corner_indices = (0, 2, 4, 6)
+        # Constrain all 8 block corners to anchor the deformable wall.
+        corner_indices = range(8)
         env_ids = torch.arange(scene.num_envs, device=sim.device)
-        for i in top_corner_indices:
+        for i in corner_indices:
             vertex_ids = block_corner_vertex_ids[:, i]
             wall_nodal_kinematic_target[env_ids, vertex_ids, :3] = wall_nodal_state[env_ids, vertex_ids, :3]
             wall_nodal_kinematic_target[env_ids, vertex_ids, 3] = 0.0
