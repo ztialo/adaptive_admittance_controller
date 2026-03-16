@@ -194,6 +194,11 @@ FLOOR_WALL_INIT_POS = (0.50, -0.1, 0.03)
 FLOOR_WALL_INIT_ROT = (0.70710678, 0.0, -0.70710678, 0.0)
 
 
+def _format_gain_tag() -> str:
+    """Return the log-folder tag for the configured admittance gains."""
+    return f"{args_cli.admittance_M:g}_{args_cli.admittance_B:g}_{args_cli.admittance_K:g}"
+
+
 def _enable_fractional_cutout_opacity():
     """Enable RTX fractional cutout opacity using type-safe settings write."""
     carb_settings = carb.settings.get_settings()
@@ -409,9 +414,10 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
     run_dir = None
     if args_cli.log:
         logs_root = REPO_ROOT / "logs" / f"adaptive_admittance_floor_{args_cli.mode}"
-        logs_root.mkdir(parents=True, exist_ok=True)
+        gain_logs_root = logs_root / _format_gain_tag()
+        gain_logs_root.mkdir(parents=True, exist_ok=True)
         run_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
-        run_dir = logs_root / run_tag
+        run_dir = gain_logs_root / run_tag
         run_dir.mkdir(parents=True, exist_ok=True)
         ft_log_path = run_dir / "ft_env0.csv"
         ft_csv_file = open(ft_log_path, "w", newline="", encoding="utf-8")
