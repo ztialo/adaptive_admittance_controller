@@ -51,11 +51,11 @@ parser.add_argument(
     help="Environment mode: rigid wall, deformable soft wall, or rigid wall with compliant contact.",
 )
 parser.add_argument("--soft", action="store_true", default=False, help=argparse.SUPPRESS)
-parser.add_argument("--youngs_modulus", type=float, default=5e3, help="Young's modulus for deformable wall in --mode soft.")
+parser.add_argument("--youngs_modulus", type=float, default=5e5, help="Young's modulus for deformable wall in --mode soft.")
 parser.add_argument(
     "--compliant_contact_stiffness",
     type=float,
-    default=1e6,
+    default=3e7,
     help="Compliant contact stiffness for rigid wall in --mode compliant.",
 )
 parser.add_argument(
@@ -127,7 +127,7 @@ parser.add_argument(
 
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
-args_cli.enable_cameras = True
+args_cli.enable_cameras = args_cli.record is not None
 
 # Temporary backward compatibility for older scripts using --soft.
 if args_cli.soft:
@@ -264,19 +264,20 @@ class SceneCfg(InteractiveSceneCfg):
     robot.actuators["franka_forearm"].damping = 80.0
     robot.spawn.rigid_props.disable_gravity = True
 
-    observer_camera = CameraCfg(
-        prim_path="{ENV_REGEX_NS}/ObserverCamera",
-        update_period=0.0,
-        height=720,
-        width=1280,
-        data_types=["rgb"],
-        spawn=sim_utils.PinholeCameraCfg(
-            focal_length=24.0,
-            focus_distance=400.0,
-            horizontal_aperture=20.955,
-            clipping_range=(0.1, 1.0e5),
-        ),
-    )
+    if args_cli.enable_cameras:
+        observer_camera = CameraCfg(
+            prim_path="{ENV_REGEX_NS}/ObserverCamera",
+            update_period=0.0,
+            height=720,
+            width=1280,
+            data_types=["rgb"],
+            spawn=sim_utils.PinholeCameraCfg(
+                focal_length=24.0,
+                focus_distance=400.0,
+                horizontal_aperture=20.955,
+                clipping_range=(0.1, 1.0e5),
+            ),
+        )
 
 
 def _find_block_eight_corner_vertex_ids(
@@ -359,7 +360,7 @@ def update_states(robot: Articulation, ee_frame_idx: int, arm_joint_ids: list[in
 
 def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
     robot = scene["robot"]
-    observer_camera = scene["observer_camera"]
+    observer_camera = scene["observer_camera"] if args_cli.enable_cameras else None
     is_soft_mode = args_cli.mode == "soft"
     is_compliant_mode = args_cli.mode == "compliant"
     soft_wall: DeformableObject | None = scene["soft_wall"] if is_soft_mode else None
@@ -373,7 +374,8 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
     # Observer camera + main camera matching viewpoint.
     camera_positions = env_origins + torch.tensor([0.7, 0.8, 0.7], device=sim.device, dtype=env_origins.dtype)
     camera_targets = env_origins + torch.tensor([0.5, -0.1, 0.0], device=sim.device, dtype=env_origins.dtype)
-    observer_camera.set_world_poses_from_view(camera_positions, camera_targets)
+    if observer_camera is not None:
+        observer_camera.set_world_poses_from_view(camera_positions, camera_targets)
 
     # Force sensing body
     ft_body_name = "fr3_hand"
@@ -799,7 +801,8 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
             sim.step(render=True)
             robot.update(sim_dt)
             scene.update(sim_dt)
-            observer_camera.update(sim_dt)
+            if observer_camera is not None:
+                observer_camera.update(sim_dt)
 
             # CSV row
             ee_pos_b_env0 = ee_pose_b[0, 0:3].detach().cpu().tolist()
@@ -861,7 +864,7 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
                 )
                 ft_csv_file.flush()
 
-            if video_writer is not None:
+            if video_writer is not None and observer_camera is not None:
                 rgb_frame = observer_camera.data.output["rgb"][0, ..., :3].detach().cpu().numpy()
                 if rgb_frame.dtype != "uint8":
                     rgb_frame = (rgb_frame * 255.0).clip(0, 255).astype("uint8")
@@ -903,9 +906,10 @@ def main():
     scene = InteractiveScene(scene_cfg)
 
     env0_origin = scene.env_origins[0]
-    main_cam_eye = (env0_origin + torch.tensor([-0.25, 1.8, 1.55], device=sim.device)).tolist()
+    main_cam_eye = (env0_origin + torch.tensor([-0.25, 1.8, 0.5], device=sim.device)).tolist()
     main_cam_target = (env0_origin + torch.tensor([0.58, 0.0, 0.86], device=sim.device)).tolist()
-    sim.set_camera_view(main_cam_eye, main_cam_target)
+    if not getattr(args_cli, "headless", False):
+        sim.set_camera_view(main_cam_eye, main_cam_target)
 
     sim.reset()
     print("[INFO] Setup complete...")

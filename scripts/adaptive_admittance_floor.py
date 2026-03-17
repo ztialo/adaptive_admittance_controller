@@ -3,7 +3,7 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Baseline 1D admittance force-control experiment against a rigid wall.
+"""Adaptive 1D admittance force-control experiment against a wall.
 
 Flow:
 1) Move EE to pre-contact waypoint.
@@ -25,8 +25,8 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 # CLI
-parser = argparse.ArgumentParser(description="Rigid-wall baseline 1D admittance control.")
-parser.add_argument("--num_envs", type=int, default=1, help="Number of environments (baseline uses 1).")
+parser = argparse.ArgumentParser(description="Adaptive 1D admittance control experiment.")
+parser.add_argument("--num_envs", type=int, default=1, help="Number of environments (adaptive script uses 1).")
 parser.add_argument("--log", action="store_true", default=False, help="Enable CSV/video logging.")
 parser.add_argument(
     "--log_steps",
@@ -51,11 +51,11 @@ parser.add_argument(
     help="Environment mode: rigid wall, deformable soft wall, or rigid wall with compliant contact.",
 )
 parser.add_argument("--soft", action="store_true", default=False, help=argparse.SUPPRESS)
-parser.add_argument("--youngs_modulus", type=float, default=5e3, help="Young's modulus for deformable wall in --mode soft.")
+parser.add_argument("--youngs_modulus", type=float, default=5e5, help="Young's modulus for deformable wall in --mode soft.")
 parser.add_argument(
     "--compliant_contact_stiffness",
     type=float,
-    default=1e6,
+    default=3e7,
     help="Compliant contact stiffness for rigid wall in --mode compliant.",
 )
 parser.add_argument(
@@ -65,33 +65,11 @@ parser.add_argument(
     help="Compliant contact damping for rigid wall in --mode compliant.",
 )
 
-# Required baseline knobs
-parser.add_argument("--desired_contact_force", type=float, default=5.0, help="Desired normal force (N).")
-parser.add_argument("--admittance_M", type=float, default=1.0, help="Admittance virtual mass.")
-parser.add_argument("--admittance_B", type=float, default=160.0, help="Admittance virtual damping.")
-parser.add_argument("--admittance_K", type=float, default=100.0, help="Admittance virtual stiffness.")
-parser.add_argument(
-    "--enable_adaptive_K",
-    action="store_true",
-    default=False,
-    help="Enable adaptive admittance stiffness tuning from online environment stiffness estimate.",
-)
-parser.add_argument("--adaptive_K_alpha", type=float, default=0.2, help="Scale factor from k_env_hat to K_adapt.")
-parser.add_argument("--adaptive_K_beta", type=float, default=0.1, help="LPF coefficient for environment stiffness estimate.")
-parser.add_argument("--adaptive_K_min", type=float, default=10.0, help="Minimum adaptive admittance stiffness (N/m).")
-parser.add_argument("--adaptive_K_max", type=float, default=500.0, help="Maximum adaptive admittance stiffness (N/m).")
-parser.add_argument(
-    "--adaptive_K_dx_threshold",
-    type=float,
-    default=1e-4,
-    help="Minimum |dx| (m) required to update instantaneous environment stiffness estimate.",
-)
-parser.add_argument(
-    "--adaptive_K_df_threshold",
-    type=float,
-    default=0.05,
-    help="Minimum |dF| (N) required to update instantaneous environment stiffness estimate.",
-)
+# Core admittance knobs
+parser.add_argument("--desired_contact_force", type=float, default=10.0, help="Desired normal force (N).")
+parser.add_argument("--admittance_M", type=float, default=2.0, help="Admittance virtual mass.")
+parser.add_argument("--admittance_B", type=float, default=250.0, help="Admittance virtual damping.")
+parser.add_argument("--admittance_K", type=float, default=5.0, help="Admittance virtual stiffness.")
 parser.add_argument("--contact_force_threshold", type=float, default=1.0, help="Contact threshold (N).")
 parser.add_argument(
     "--soft_contact_pos_err_threshold",
@@ -106,9 +84,9 @@ parser.add_argument(
     default=0.5,
     help="Ramp time (s) from 0 to desired force. Set 0 for a pure force step.",
 )
-parser.add_argument("--force_filter_alpha", type=float, default=0.2, help="LPF alpha for measured force [0,1].")
-parser.add_argument("--max_admittance_offset", type=float, default=0.05, help="Clamp for admittance offset (m).")
-parser.add_argument("--max_admittance_velocity", type=float, default=0.05, help="Clamp for admittance velocity (m/s).")
+parser.add_argument("--force_filter_alpha", type=float, default=0.075, help="LPF alpha for measured force [0,1].")
+parser.add_argument("--max_admittance_offset", type=float, default=0.08, help="Clamp for admittance offset (m).")
+parser.add_argument("--max_admittance_velocity", type=float, default=0.1, help="Clamp for admittance velocity (m/s).")
 parser.add_argument("--debug_print_every", type=int, default=20, help="Print every N steps (0 disables).")
 parser.add_argument(
     "--enable_tracking_anti_windup",
@@ -149,16 +127,16 @@ parser.add_argument(
 
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
-args_cli.enable_cameras = True
+args_cli.enable_cameras = args_cli.record is not None
 
 # Temporary backward compatibility for older scripts using --soft.
 if args_cli.soft:
     print("[WARN] --soft is deprecated. Use --mode soft.")
     args_cli.mode = "soft"
 
-# Baseline is intentionally single-env for clarity.
+# Adaptive script is intentionally single-env for clarity.
 if args_cli.num_envs != 1:
-    print(f"[WARN] Forcing num_envs=1 for baseline (requested {args_cli.num_envs}).")
+    print(f"[WARN] Forcing num_envs=1 for adaptive script (requested {args_cli.num_envs}).")
     args_cli.num_envs = 1
 if args_cli.record is not None and not args_cli.log:
     print("[WARN] --record is ignored unless --log is enabled.")
@@ -219,7 +197,7 @@ def _enable_fractional_cutout_opacity():
 
 @configclass
 class SceneCfg(InteractiveSceneCfg):
-    """Wall-contact baseline scene (mode: rigid, soft, compliant)."""
+    """Wall-contact adaptive scene (mode: rigid, soft, compliant)."""
 
     ground = AssetBaseCfg(prim_path="/World/defaultGroundPlane", spawn=sim_utils.GroundPlaneCfg())
     dome_light = AssetBaseCfg(
@@ -280,25 +258,26 @@ class SceneCfg(InteractiveSceneCfg):
         )
 
     robot = FRANKA_3_HIGH_PD_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
-    robot.actuators["franka_shoulder"].stiffness = 400.0
+    robot.actuators["franka_shoulder"].stiffness = 1200.0
     robot.actuators["franka_shoulder"].damping = 80.0
-    robot.actuators["franka_forearm"].stiffness = 400.0
+    robot.actuators["franka_forearm"].stiffness = 1200.0
     robot.actuators["franka_forearm"].damping = 80.0
     robot.spawn.rigid_props.disable_gravity = True
 
-    observer_camera = CameraCfg(
-        prim_path="{ENV_REGEX_NS}/ObserverCamera",
-        update_period=0.0,
-        height=720,
-        width=1280,
-        data_types=["rgb"],
-        spawn=sim_utils.PinholeCameraCfg(
-            focal_length=24.0,
-            focus_distance=400.0,
-            horizontal_aperture=20.955,
-            clipping_range=(0.1, 1.0e5),
-        ),
-    )
+    if args_cli.enable_cameras:
+        observer_camera = CameraCfg(
+            prim_path="{ENV_REGEX_NS}/ObserverCamera",
+            update_period=0.0,
+            height=720,
+            width=1280,
+            data_types=["rgb"],
+            spawn=sim_utils.PinholeCameraCfg(
+                focal_length=24.0,
+                focus_distance=400.0,
+                horizontal_aperture=20.955,
+                clipping_range=(0.1, 1.0e5),
+            ),
+        )
 
 
 def _find_block_eight_corner_vertex_ids(
@@ -381,7 +360,7 @@ def update_states(robot: Articulation, ee_frame_idx: int, arm_joint_ids: list[in
 
 def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
     robot = scene["robot"]
-    observer_camera = scene["observer_camera"]
+    observer_camera = scene["observer_camera"] if args_cli.enable_cameras else None
     is_soft_mode = args_cli.mode == "soft"
     is_compliant_mode = args_cli.mode == "compliant"
     soft_wall: DeformableObject | None = scene["soft_wall"] if is_soft_mode else None
@@ -395,7 +374,8 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
     # Observer camera + main camera matching viewpoint.
     camera_positions = env_origins + torch.tensor([0.7, 0.8, 0.7], device=sim.device, dtype=env_origins.dtype)
     camera_targets = env_origins + torch.tensor([0.5, -0.1, 0.0], device=sim.device, dtype=env_origins.dtype)
-    observer_camera.set_world_poses_from_view(camera_positions, camera_targets)
+    if observer_camera is not None:
+        observer_camera.set_world_poses_from_view(camera_positions, camera_targets)
 
     # Force sensing body
     ft_body_name = "fr3_hand"
@@ -447,9 +427,6 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
                 "f_compression_pos_filt",
                 "f_des_n",
                 "f_err_n",
-                "k_env_inst",
-                "k_env_hat",
-                "K_used",
                 "admittance_offset",
                 "admittance_velocity",
                 "admittance_acceleration",
@@ -487,7 +464,7 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
     video_writer = None
     video_path = None
     if args_cli.log and run_dir is not None and args_cli.record is not None:
-        video_path = run_dir / "admittance_baseline_floor_env0.mp4"
+        video_path = run_dir / "adaptive_admittance_floor_env0.mp4"
         fps = max(1, int(round(1.0 / sim.get_physics_dt())))
         video_writer = imageio.get_writer(video_path, fps=fps)
 
@@ -573,12 +550,6 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
     x_cmd_b = ee_pose_b[:, 0:3].clone()
     x_cmd_n = torch.zeros(scene.num_envs, device=sim.device)
     x_curr_n = torch.zeros(scene.num_envs, device=sim.device)
-    x_curr_n_prev_for_k = torch.zeros(scene.num_envs, device=sim.device)
-    f_comp_prev_for_k = torch.zeros(scene.num_envs, device=sim.device)
-    k_env_inst = torch.full((scene.num_envs,), float("nan"), device=sim.device)
-    k_env_hat = torch.zeros(scene.num_envs, device=sim.device)
-    k_env_valid = torch.zeros(scene.num_envs, dtype=torch.bool, device=sim.device)
-    K_used = torch.full((scene.num_envs,), args_cli.admittance_K, device=sim.device)
     tracking_error_n = torch.zeros(scene.num_envs, device=sim.device)
     tracking_error_n_prev = torch.zeros(scene.num_envs, device=sim.device)
     non_contact_correction_mag = torch.zeros(scene.num_envs, device=sim.device)
@@ -627,12 +598,6 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
                 admittance_offset.zero_()
                 admittance_velocity.zero_()
                 admittance_acceleration.zero_()
-                x_curr_n_prev_for_k.zero_()
-                f_comp_prev_for_k.zero_()
-                k_env_inst.fill_(float("nan"))
-                k_env_hat.zero_()
-                k_env_valid.zero_()
-                K_used.fill_(args_cli.admittance_K)
                 waypoint_hold_counter = 0
                 steps_since_reset = 0
             else:
@@ -718,42 +683,6 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
                 x_cmd_n_prev = torch.sum((x_cmd_prev_b - x_nominal_b) * contact_axis_b.unsqueeze(0), dim=-1)
                 tracking_error_n_prev = x_cmd_n_prev - x_curr_n
 
-                if args_cli.enable_adaptive_K:
-                    dx_for_k = x_curr_n - x_curr_n_prev_for_k
-                    dF_for_k = f_compression_pos_filt - f_comp_prev_for_k
-                    abs_dx = torch.abs(dx_for_k)
-                    abs_dF = torch.abs(dF_for_k)
-                    valid_update = torch.logical_and(
-                        contact_active,
-                        torch.logical_and(abs_dx > args_cli.adaptive_K_dx_threshold, abs_dF > args_cli.adaptive_K_df_threshold),
-                    )
-                    safe_dx = torch.where(abs_dx > 1.0e-9, dx_for_k, torch.ones_like(dx_for_k))
-                    k_env_inst_candidate = dF_for_k / safe_dx
-                    valid_inst = torch.logical_and(
-                        valid_update,
-                        torch.logical_and(torch.isfinite(k_env_inst_candidate), k_env_inst_candidate > 0.0),
-                    )
-                    k_env_inst_candidate = torch.clamp(k_env_inst_candidate, max=1.0e6)
-                    k_env_inst = torch.where(valid_inst, k_env_inst_candidate, k_env_inst)
-                    k_env_hat = torch.where(
-                        valid_inst,
-                        args_cli.adaptive_K_beta * k_env_inst_candidate + (1.0 - args_cli.adaptive_K_beta) * k_env_hat,
-                        k_env_hat,
-                    )
-                    k_env_valid = torch.logical_or(k_env_valid, valid_inst)
-                    K_adapt = args_cli.adaptive_K_alpha * k_env_hat
-                    K_adapt = torch.clamp(K_adapt, args_cli.adaptive_K_min, args_cli.adaptive_K_max)
-                    K_used = torch.where(
-                        torch.logical_and(contact_active, k_env_valid),
-                        K_adapt,
-                        torch.full_like(K_adapt, args_cli.admittance_K),
-                    )
-                else:
-                    K_used.fill_(args_cli.admittance_K)
-
-                x_curr_n_prev_for_k = x_curr_n.clone()
-                f_comp_prev_for_k = f_compression_pos_filt.clone()
-
                 # Optional anti-windup: integrate admittance only while Cartesian normal tracking is good.
                 admittance_integrate_enabled = contact_active.clone()
                 if args_cli.enable_tracking_anti_windup:
@@ -764,7 +693,7 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
                 # Admittance update (1D) with active clamps.
                 admittance_acceleration = torch.where(
                     admittance_integrate_enabled,
-                    (f_err_n - args_cli.admittance_B * admittance_velocity - K_used * admittance_offset)
+                    (f_err_n - args_cli.admittance_B * admittance_velocity - args_cli.admittance_K * admittance_offset)
                     / args_cli.admittance_M,
                     torch.zeros_like(admittance_acceleration),
                 )
@@ -844,9 +773,6 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
                         f"Fcomp={float(f_compression_pos_filt[0].item()):.3f}N "
                         f"Fdes={float(f_des_n[0].item()):.3f}N "
                         f"Ferr={float(f_err_n[0].item()):.3f}N "
-                        f"Kused={float(K_used[0].item()):.2f} "
-                        f"kenv_inst={float(k_env_inst[0].item()):.2f} "
-                        f"kenv_hat={float(k_env_hat[0].item()):.2f} "
                         f"x={float(admittance_offset[0].item()):.5f}m "
                         f"xcmd_n={float(x_cmd_n[0].item()):.5f}m "
                         f"xcurr_n={float(x_curr_n[0].item()):.5f}m "
@@ -875,7 +801,8 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
             sim.step(render=True)
             robot.update(sim_dt)
             scene.update(sim_dt)
-            observer_camera.update(sim_dt)
+            if observer_camera is not None:
+                observer_camera.update(sim_dt)
 
             # CSV row
             ee_pos_b_env0 = ee_pose_b[0, 0:3].detach().cpu().tolist()
@@ -909,9 +836,6 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
                         float(f_compression_pos_filt[0].item()) if "f_compression_pos_filt" in locals() else 0.0,
                         float(f_des_n[0].item()) if "f_des_n" in locals() else 0.0,
                         float(f_err_n[0].item()) if "f_err_n" in locals() else 0.0,
-                        float(k_env_inst[0].item()),
-                        float(k_env_hat[0].item()),
-                        float(K_used[0].item()),
                         float(admittance_offset[0].item()),
                         float(admittance_velocity[0].item()),
                         float(admittance_acceleration[0].item()),
@@ -940,7 +864,7 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
                 )
                 ft_csv_file.flush()
 
-            if video_writer is not None:
+            if video_writer is not None and observer_camera is not None:
                 rgb_frame = observer_camera.data.output["rgb"][0, ..., :3].detach().cpu().numpy()
                 if rgb_frame.dtype != "uint8":
                     rgb_frame = (rgb_frame * 255.0).clip(0, 255).astype("uint8")
@@ -964,7 +888,10 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
             plot_script = REPO_ROOT / "scripts" / "plot_data.py"
             if plot_script.exists():
                 print(f"[INFO] Generating plot from log: {ft_log_path}")
-                plot_title = f"Adaptive Admittance Floor ({args_cli.mode})"
+                plot_title = (
+                    f"Adaptive Admittance Floor ({args_cli.mode}) "
+                    f"M={args_cli.admittance_M:g}, B={args_cli.admittance_B:g}, K={args_cli.admittance_K:g}"
+                )
                 subprocess.run([sys.executable, str(plot_script), str(ft_log_path), "--title", plot_title], check=False)
 
 
@@ -979,9 +906,10 @@ def main():
     scene = InteractiveScene(scene_cfg)
 
     env0_origin = scene.env_origins[0]
-    main_cam_eye = (env0_origin + torch.tensor([-0.25, 1.8, 1.55], device=sim.device)).tolist()
+    main_cam_eye = (env0_origin + torch.tensor([-0.25, 1.8, 0.5], device=sim.device)).tolist()
     main_cam_target = (env0_origin + torch.tensor([0.58, 0.0, 0.86], device=sim.device)).tolist()
-    sim.set_camera_view(main_cam_eye, main_cam_target)
+    if not getattr(args_cli, "headless", False):
+        sim.set_camera_view(main_cam_eye, main_cam_target)
 
     sim.reset()
     print("[INFO] Setup complete...")
