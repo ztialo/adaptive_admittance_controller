@@ -13,6 +13,7 @@ Flow:
 """
 
 import argparse
+from collections import deque
 import subprocess
 import sys
 from datetime import datetime
@@ -51,7 +52,7 @@ parser.add_argument(
     help="Environment mode: rigid wall, deformable soft wall, or rigid wall with compliant contact.",
 )
 parser.add_argument("--soft", action="store_true", default=False, help=argparse.SUPPRESS)
-parser.add_argument("--youngs_modulus", type=float, default=3e3, help="Young's modulus for deformable wall in --mode soft.")
+parser.add_argument("--youngs_modulus", type=float, default=5e3, help="Young's modulus for deformable wall in --mode soft.")
 parser.add_argument(
     "--compliant_contact_stiffness",
     type=float,
@@ -70,6 +71,36 @@ parser.add_argument("--desired_contact_force", type=float, default=10.0, help="D
 parser.add_argument("--admittance_M", type=float, default=2.0, help="Admittance virtual mass.")
 parser.add_argument("--admittance_B", type=float, default=250.0, help="Admittance virtual damping.")
 parser.add_argument("--admittance_K", type=float, default=5.0, help="Admittance virtual stiffness.")
+parser.add_argument(
+    "--adaptive_damping_B_max",
+    type=float,
+    default=320.0,
+    help="Maximum adaptive admittance damping used for the softest estimated environment.",
+)
+parser.add_argument(
+    "--stiffness_estimation_window_size",
+    type=int,
+    default=20,
+    help="Rolling window size for online least-squares environment stiffness estimation.",
+)
+parser.add_argument(
+    "--stiffness_estimation_min_z_var",
+    type=float,
+    default=5.0e-4,
+    help="Minimum z-compression variation required in the estimation window before updating stiffness (m).",
+)
+parser.add_argument(
+    "--stiffness_estimation_alpha",
+    type=float,
+    default=0.2,
+    help="LPF alpha for the clipped environment stiffness estimate [0,1].",
+)
+parser.add_argument(
+    "--adaptive_damping_alpha",
+    type=float,
+    default=0.2,
+    help="LPF alpha for the adaptive damping command [0,1].",
+)
 parser.add_argument("--contact_force_threshold", type=float, default=1.0, help="Contact threshold (N).")
 parser.add_argument(
     "--soft_contact_pos_err_threshold",
@@ -143,6 +174,10 @@ if args_cli.record is not None and not args_cli.log:
 
 # Clamp alpha into [0, 1]
 args_cli.force_filter_alpha = max(0.0, min(1.0, args_cli.force_filter_alpha))
+args_cli.stiffness_estimation_alpha = max(0.0, min(1.0, args_cli.stiffness_estimation_alpha))
+args_cli.adaptive_damping_alpha = max(0.0, min(1.0, args_cli.adaptive_damping_alpha))
+args_cli.stiffness_estimation_window_size = max(2, args_cli.stiffness_estimation_window_size)
+args_cli.adaptive_damping_B_max = max(args_cli.adaptive_damping_B_max, args_cli.admittance_B)
 
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
@@ -170,8 +205,9 @@ from source.franka import FRANKA_3_HIGH_PD_CFG  # noqa: E402
 
 FLOOR_WALL_INIT_POS = (0.50, -0.1, 0.03)
 FLOOR_WALL_INIT_ROT = (0.70710678, 0.0, -0.70710678, 0.0)
-K_ENV_AVG_FORCE_THRESHOLD_N = 2.0
-K_ENV_AVG_CONFIRM_STEPS = 3
+STIFFNESS_CONTACT_FORCE_THRESHOLD_N = 2.0
+K_ENV_MIN = 162.0
+K_ENV_MAX = 19464.0
 
 
 def _format_gain_tag() -> str:
@@ -435,6 +471,13 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
                 "f_compression_pos_filt",
                 "f_des_n",
                 "f_err_n",
+                "z_comp",
+                "k_env_raw",
+                "k_env_filtered",
+                "adaptive_lambda",
+                "b_target",
+                "b_used",
+                "stiffness_valid",
                 "admittance_offset",
                 "admittance_velocity",
                 "admittance_acceleration",
@@ -560,6 +603,15 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
     x_curr_n = torch.zeros(scene.num_envs, device=sim.device)
     tracking_error_n = torch.zeros(scene.num_envs, device=sim.device)
     tracking_error_n_prev = torch.zeros(scene.num_envs, device=sim.device)
+    z_contact_n = torch.zeros(scene.num_envs, device=sim.device)
+    z_comp = torch.zeros(scene.num_envs, device=sim.device)
+    k_env_raw = torch.full((scene.num_envs,), float("nan"), device=sim.device)
+    k_env_filtered = torch.full((scene.num_envs,), float("nan"), device=sim.device)
+    adaptive_lambda = torch.zeros(scene.num_envs, device=sim.device)
+    b_target = torch.full((scene.num_envs,), args_cli.admittance_B, device=sim.device)
+    b_used = torch.full((scene.num_envs,), args_cli.admittance_B, device=sim.device)
+    stiffness_valid = torch.zeros(scene.num_envs, dtype=torch.bool, device=sim.device)
+    stiffness_contact_started = torch.zeros(scene.num_envs, dtype=torch.bool, device=sim.device)
     non_contact_correction_mag = torch.zeros(scene.num_envs, device=sim.device)
     admittance_integrate_enabled = torch.zeros(scene.num_envs, dtype=torch.bool, device=sim.device)
     ik_target_delta_norm = torch.zeros(scene.num_envs, device=sim.device)
@@ -567,8 +619,8 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
     x_cmd_step_clipped = torch.zeros(scene.num_envs, dtype=torch.bool, device=sim.device)
     k_env_est_sum = 0.0
     k_env_est_count = 0
-    k_env_avg_confirm_counter = torch.zeros(scene.num_envs, dtype=torch.long, device=sim.device)
-    k_env_avg_active = torch.zeros(scene.num_envs, dtype=torch.bool, device=sim.device)
+    z_comp_window: deque[float] = deque(maxlen=args_cli.stiffness_estimation_window_size)
+    f_comp_window: deque[float] = deque(maxlen=args_cli.stiffness_estimation_window_size)
 
     steps_since_reset = 0
     count = 0
@@ -610,8 +662,17 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
                 admittance_offset.zero_()
                 admittance_velocity.zero_()
                 admittance_acceleration.zero_()
-                k_env_avg_confirm_counter.zero_()
-                k_env_avg_active.zero_()
+                z_contact_n.zero_()
+                z_comp.zero_()
+                k_env_raw.fill_(float("nan"))
+                k_env_filtered.fill_(float("nan"))
+                adaptive_lambda.zero_()
+                b_target.fill_(args_cli.admittance_B)
+                b_used.fill_(args_cli.admittance_B)
+                stiffness_valid.zero_()
+                stiffness_contact_started.zero_()
+                z_comp_window.clear()
+                f_comp_window.clear()
                 waypoint_hold_counter = 0
                 steps_since_reset = 0
             else:
@@ -641,14 +702,6 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
                 f_compression_pos_filt = (
                     args_cli.force_filter_alpha * f_compression_pos_raw
                     + (1.0 - args_cli.force_filter_alpha) * f_compression_pos_filt
-                )
-                k_env_avg_confirm_counter = torch.where(
-                    f_compression_pos_filt > K_ENV_AVG_FORCE_THRESHOLD_N,
-                    k_env_avg_confirm_counter + 1,
-                    torch.zeros_like(k_env_avg_confirm_counter),
-                )
-                k_env_avg_active = torch.logical_or(
-                    k_env_avg_active, k_env_avg_confirm_counter >= K_ENV_AVG_CONFIRM_STEPS
                 )
 
                 # Contact detection only during final-goal approach and after delay.
@@ -702,11 +755,64 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
                 x_nominal_b = ee_target_pose_b[:, 0:3]
                 x_delta_b = x_curr_b - x_nominal_b
                 x_curr_n = torch.sum(x_delta_b * contact_axis_b.unsqueeze(0), dim=-1)
-                valid_k_env = torch.logical_and(k_env_avg_active, x_curr_n > 1.0e-6)
+                z_current_n = torch.sum(x_curr_b * contact_axis_b.unsqueeze(0), dim=-1)
+                first_stiffness_contact = torch.logical_and(
+                    ~stiffness_contact_started, f_compression_pos_filt > STIFFNESS_CONTACT_FORCE_THRESHOLD_N
+                )
+                z_contact_n = torch.where(first_stiffness_contact, z_current_n, z_contact_n)
+                stiffness_contact_started = torch.logical_or(stiffness_contact_started, first_stiffness_contact)
+                z_comp = torch.where(stiffness_contact_started, z_current_n - z_contact_n, torch.zeros_like(z_current_n))
+                z_comp = torch.clamp(z_comp, min=0.0)
+
+                k_env_raw.fill_(float("nan"))
+                if bool(stiffness_contact_started[0].item()):
+                    z_comp_window.append(float(z_comp[0].item()))
+                    f_comp_window.append(float(f_compression_pos_filt[0].item()))
+                    if len(z_comp_window) >= args_cli.stiffness_estimation_window_size:
+                        z_window = torch.tensor(list(z_comp_window), device=sim.device)
+                        f_window = torch.tensor(list(f_comp_window), device=sim.device)
+                        z_span = torch.max(z_window) - torch.min(z_window)
+                        if float(z_span.item()) >= args_cli.stiffness_estimation_min_z_var:
+                            z_centered = z_window - torch.mean(z_window)
+                            denom = torch.sum(z_centered * z_centered)
+                            if float(denom.item()) > 1.0e-12:
+                                raw_slope = torch.sum(z_centered * (f_window - torch.mean(f_window))) / denom
+                                k_env_raw[0] = raw_slope
+                                k_env_clipped = torch.clamp(raw_slope, K_ENV_MIN, K_ENV_MAX)
+                                k_env_filtered[0] = (
+                                    k_env_clipped
+                                    if not bool(stiffness_valid[0].item())
+                                    else args_cli.stiffness_estimation_alpha * k_env_clipped
+                                    + (1.0 - args_cli.stiffness_estimation_alpha) * k_env_filtered[0]
+                                )
+                                stiffness_valid[0] = True
+
+                adaptive_lambda = torch.where(
+                    stiffness_valid,
+                    torch.clamp((k_env_filtered - K_ENV_MIN) / (K_ENV_MAX - K_ENV_MIN), 0.0, 1.0),
+                    torch.zeros_like(adaptive_lambda),
+                )
+                b_target = torch.where(
+                    stiffness_valid,
+                    args_cli.adaptive_damping_B_max
+                    - adaptive_lambda * (args_cli.adaptive_damping_B_max - args_cli.admittance_B),
+                    torch.full_like(b_target, args_cli.admittance_B),
+                )
+                damping_update_enabled = torch.logical_and(stiffness_valid, torch.abs(f_err_n) < 1.0)
+                b_used = torch.where(
+                    damping_update_enabled,
+                    args_cli.adaptive_damping_alpha * b_target + (1.0 - args_cli.adaptive_damping_alpha) * b_used,
+                    torch.where(stiffness_valid, b_used, torch.full_like(b_used, args_cli.admittance_B)),
+                )
+                b_used = torch.where(
+                    stiffness_valid,
+                    b_used,
+                    torch.full_like(b_used, args_cli.admittance_B),
+                )
+                valid_k_env = stiffness_valid
                 if torch.any(valid_k_env):
-                    k_env_est = f_compression_pos_filt[valid_k_env] / x_curr_n[valid_k_env]
-                    k_env_est_sum += float(torch.sum(k_env_est).item())
-                    k_env_est_count += int(k_env_est.numel())
+                    k_env_est_sum += float(torch.sum(k_env_filtered[valid_k_env]).item())
+                    k_env_est_count += int(torch.sum(valid_k_env).item())
                 x_cmd_n_prev = torch.sum((x_cmd_prev_b - x_nominal_b) * contact_axis_b.unsqueeze(0), dim=-1)
                 tracking_error_n_prev = x_cmd_n_prev - x_curr_n
 
@@ -720,7 +826,7 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
                 # Admittance update (1D) with active clamps.
                 admittance_acceleration = torch.where(
                     admittance_integrate_enabled,
-                    (f_err_n - args_cli.admittance_B * admittance_velocity - args_cli.admittance_K * admittance_offset)
+                    (f_err_n - b_used * admittance_velocity - args_cli.admittance_K * admittance_offset)
                     / args_cli.admittance_M,
                     torch.zeros_like(admittance_acceleration),
                 )
@@ -800,6 +906,12 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
                         f"Fcomp={float(f_compression_pos_filt[0].item()):.3f}N "
                         f"Fdes={float(f_des_n[0].item()):.3f}N "
                         f"Ferr={float(f_err_n[0].item()):.3f}N "
+                        f"zcomp={float(z_comp[0].item()):.5f}m "
+                        f"Kraw={float(k_env_raw[0].item()) if torch.isfinite(k_env_raw[0]) else float('nan'):.3f} "
+                        f"Kfilt={float(k_env_filtered[0].item()) if torch.isfinite(k_env_filtered[0]) else float('nan'):.3f} "
+                        f"lam={float(adaptive_lambda[0].item()):.4f} "
+                        f"Btar={float(b_target[0].item()):.3f} "
+                        f"Buse={float(b_used[0].item()):.3f} "
                         f"x={float(admittance_offset[0].item()):.5f}m "
                         f"xcmd_n={float(x_cmd_n[0].item()):.5f}m "
                         f"xcurr_n={float(x_curr_n[0].item()):.5f}m "
@@ -807,6 +919,7 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
                         f"xdot={float(admittance_velocity[0].item()):.5f}m/s "
                         f"xddot={float(admittance_acceleration[0].item()):.5f}m/s2 "
                         f"aw={bool(admittance_integrate_enabled[0].item())} "
+                        f"stiff_valid={bool(stiffness_valid[0].item())} "
                         f"nc_mag={float(non_contact_correction_mag[0].item()):.5f} "
                         f"ik_lim={bool(ik_target_out_of_limits[0].item())} "
                         f"xcmd=({float(x_cmd_b[0, 0].item()):.4f}, {float(x_cmd_b[0, 1].item()):.4f}, {float(x_cmd_b[0, 2].item()):.4f}) "
@@ -863,6 +976,13 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
                         float(f_compression_pos_filt[0].item()) if "f_compression_pos_filt" in locals() else 0.0,
                         float(f_des_n[0].item()) if "f_des_n" in locals() else 0.0,
                         float(f_err_n[0].item()) if "f_err_n" in locals() else 0.0,
+                        float(z_comp[0].item()) if "z_comp" in locals() else 0.0,
+                        float(k_env_raw[0].item()) if torch.isfinite(k_env_raw[0]) else float("nan"),
+                        float(k_env_filtered[0].item()) if torch.isfinite(k_env_filtered[0]) else float("nan"),
+                        float(adaptive_lambda[0].item()) if "adaptive_lambda" in locals() else 0.0,
+                        float(b_target[0].item()) if "b_target" in locals() else float(args_cli.admittance_B),
+                        float(b_used[0].item()) if "b_used" in locals() else float(args_cli.admittance_B),
+                        int(stiffness_valid[0].item()) if "stiffness_valid" in locals() else 0,
                         float(admittance_offset[0].item()),
                         float(admittance_velocity[0].item()),
                         float(admittance_acceleration[0].item()),
@@ -908,14 +1028,12 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
     finally:
         if k_env_est_count > 0:
             print(
-                "[INFO] Average K_env estimate after "
-                f"Fcomp>{K_ENV_AVG_FORCE_THRESHOLD_N:g} N for {K_ENV_AVG_CONFIRM_STEPS} consecutive steps: "
+                "[INFO] Average filtered K_env estimate after stiffness-valid updates: "
                 f"{k_env_est_sum / k_env_est_count:.6g} N/m"
             )
         else:
             print(
-                "[INFO] Average K_env estimate after "
-                f"Fcomp>{K_ENV_AVG_FORCE_THRESHOLD_N:g} N for {K_ENV_AVG_CONFIRM_STEPS} consecutive steps: "
+                "[INFO] Average filtered K_env estimate after stiffness-valid updates: "
                 "unavailable (no valid samples)"
             )
         if ft_csv_file is not None:
@@ -928,7 +1046,7 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
             if plot_script.exists():
                 print(f"[INFO] Generating plot from log: {ft_log_path}")
                 plot_title = (
-                    f"Adaptive Admittance Floor ({args_cli.mode}) "
+                    f"Adaptive Admittance Control ({args_cli.mode}) "
                     f"M={args_cli.admittance_M:g}, B={args_cli.admittance_B:g}, K={args_cli.admittance_K:g}"
                 )
                 subprocess.run([sys.executable, str(plot_script), str(ft_log_path), "--title", plot_title], check=False)

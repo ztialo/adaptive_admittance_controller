@@ -49,6 +49,9 @@ def main():
     mode_values: list[str] = []
     x_cmd_n_values: list[float] = []
     x_curr_n_values: list[float] = []
+    k_env_filtered_values: list[float] = []
+    stiffness_valid_values: list[float] = []
+    b_used_values: list[float] = []
 
     with args.csv_path.open("r", newline="") as f:
         reader = csv.DictReader(f)
@@ -66,6 +69,9 @@ def main():
         has_x_ddot_col = "admittance_acceleration" in fieldnames
         has_x_cmd_n_col = "x_cmd_n" in fieldnames
         has_x_curr_n_col = "x_curr_n" in fieldnames
+        has_k_env_filtered_col = "k_env_filtered" in fieldnames
+        has_stiffness_valid_col = "stiffness_valid" in fieldnames
+        has_b_used_col = "b_used" in fieldnames
         has_f_des_col = "f_des_n" in fieldnames
         has_f_comp_filt_col = "f_compression_pos_filt" in fieldnames
         has_fz_col = "fz" in fieldnames
@@ -105,6 +111,12 @@ def main():
                 x_cmd_n_values.append(_float_or_nan(row.get("x_cmd_n")))
             if has_x_curr_n_col:
                 x_curr_n_values.append(_float_or_nan(row.get("x_curr_n")))
+            if has_k_env_filtered_col:
+                k_env_filtered_values.append(_float_or_nan(row.get("k_env_filtered")))
+            if has_stiffness_valid_col:
+                stiffness_valid_values.append(_float_or_nan(row.get("stiffness_valid")))
+            if has_b_used_col:
+                b_used_values.append(_float_or_nan(row.get("b_used")))
     if not force_values:
         raise ValueError("No valid rows found in CSV.")
 
@@ -118,9 +130,14 @@ def main():
         x = np.asarray(steps, dtype=float)
         x_label = "Step"
 
-    # Layout: always 3 rows x 1 column so x-axis lines up across plots.
-    fig, axes = plt.subplots(3, 1, figsize=(14, 10), sharex=True)
-    force_ax, x_pos_ax, x_dyn_ax = axes
+    has_b_panel = len(b_used_values) == len(x)
+    num_main_rows = 4 if has_b_panel else 3
+    fig_height = 12 if has_b_panel else 10
+    fig, axes = plt.subplots(num_main_rows, 1, figsize=(14, fig_height), sharex=True)
+    force_ax = axes[0]
+    x_pos_ax = axes[1]
+    x_dyn_ax = axes[2]
+    b_ax = axes[3] if has_b_panel else None
 
     force_label = "Fcomp" if force_col_name == "f_compression_pos_filt" else "Fz"
     force_ax.plot(x, force_meas, linewidth=1.4, color="tab:blue", label=force_label)
@@ -198,6 +215,17 @@ def main():
     if x_dyn_ax.has_data():
         x_dyn_ax.legend(loc="best")
 
+    if b_ax is not None:
+        b_used = np.asarray(b_used_values, dtype=float)
+        b_ax.plot(x, b_used, color="tab:brown", linewidth=1.2, label="B_used")
+        b_ax.set_title("Adaptive Damping")
+        b_ax.set_xlabel(x_label)
+        b_ax.set_ylabel("B")
+        b_ax.grid(True, alpha=0.3)
+        b_ax.legend(loc="best")
+    else:
+        x_dyn_ax.set_xlabel(x_label)
+
     fig.suptitle(title)
     plt.tight_layout()
     save_path = args.save if args.save is not None else args.csv_path.with_suffix(".png")
@@ -240,35 +268,40 @@ def main():
         ax_xn.grid(True, alpha=0.3)
         ax_xn.legend(loc="best")
 
-        x_curr_n = np.asarray(x_curr_n_values, dtype=float)
-        k_env_active = np.zeros_like(x_curr_n, dtype=bool)
-        confirm_counter = 0
-        for idx, force_val in enumerate(force_meas):
-            if idx % K_ENV_PLOT_RESET_STEPS == 0:
-                confirm_counter = 0
-            if np.isfinite(force_val) and force_val > K_ENV_PLOT_FORCE_THRESHOLD_N:
-                confirm_counter += 1
-            else:
-                confirm_counter = 0
-            if confirm_counter >= K_ENV_PLOT_CONFIRM_STEPS:
-                k_env_active[idx] = True
-        for start_idx in range(0, len(k_env_active), K_ENV_PLOT_RESET_STEPS):
-            end_idx = min(start_idx + K_ENV_PLOT_RESET_STEPS, len(k_env_active))
-            k_env_active[start_idx:end_idx] = np.logical_or.accumulate(k_env_active[start_idx:end_idx])
-        min_penetration = 1.0e-5
-        k_env_est = np.zeros_like(x_curr_n, dtype=float)
-        valid_k_env = np.isfinite(force_meas) & np.isfinite(x_curr_n) & (x_curr_n > min_penetration) & k_env_active
-        k_env_est[valid_k_env] = force_meas[valid_k_env] / x_curr_n[valid_k_env]
+        if len(k_env_filtered_values) == len(x) and len(stiffness_valid_values) == len(x):
+            k_env_est_smooth = np.asarray(k_env_filtered_values, dtype=float)
+            stiffness_valid = np.asarray(stiffness_valid_values, dtype=float) > 0.5
+            k_env_est_smooth = np.where(stiffness_valid & np.isfinite(k_env_est_smooth), k_env_est_smooth, 0.0)
+        else:
+            x_curr_n = np.asarray(x_curr_n_values, dtype=float)
+            k_env_active = np.zeros_like(x_curr_n, dtype=bool)
+            confirm_counter = 0
+            for idx, force_val in enumerate(force_meas):
+                if idx % K_ENV_PLOT_RESET_STEPS == 0:
+                    confirm_counter = 0
+                if np.isfinite(force_val) and force_val > K_ENV_PLOT_FORCE_THRESHOLD_N:
+                    confirm_counter += 1
+                else:
+                    confirm_counter = 0
+                if confirm_counter >= K_ENV_PLOT_CONFIRM_STEPS:
+                    k_env_active[idx] = True
+            for start_idx in range(0, len(k_env_active), K_ENV_PLOT_RESET_STEPS):
+                end_idx = min(start_idx + K_ENV_PLOT_RESET_STEPS, len(k_env_active))
+                k_env_active[start_idx:end_idx] = np.logical_or.accumulate(k_env_active[start_idx:end_idx])
+            min_penetration = 1.0e-5
+            k_env_est = np.zeros_like(x_curr_n, dtype=float)
+            valid_k_env = np.isfinite(force_meas) & np.isfinite(x_curr_n) & (x_curr_n > min_penetration) & k_env_active
+            k_env_est[valid_k_env] = force_meas[valid_k_env] / x_curr_n[valid_k_env]
 
-        k_env_est_smooth = np.zeros_like(k_env_est, dtype=float)
-        alpha = 0.15
-        ema_val = 0.0
-        for idx, value in enumerate(k_env_est):
-            if k_env_active[idx] and np.isfinite(value):
-                ema_val = alpha * value + (1.0 - alpha) * ema_val
-            else:
-                ema_val = 0.0
-            k_env_est_smooth[idx] = ema_val
+            k_env_est_smooth = np.zeros_like(k_env_est, dtype=float)
+            alpha = 0.15
+            ema_val = 0.0
+            for idx, value in enumerate(k_env_est):
+                if k_env_active[idx] and np.isfinite(value):
+                    ema_val = alpha * value + (1.0 - alpha) * ema_val
+                else:
+                    ema_val = 0.0
+                k_env_est_smooth[idx] = ema_val
 
         if np.any(np.isfinite(k_env_est_smooth)):
             ax_kenv.plot(x, k_env_est_smooth, color="tab:red", linewidth=1.4, label="K_env est EMA")
