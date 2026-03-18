@@ -51,7 +51,7 @@ parser.add_argument(
     help="Environment mode: rigid wall, deformable soft wall, or rigid wall with compliant contact.",
 )
 parser.add_argument("--soft", action="store_true", default=False, help=argparse.SUPPRESS)
-parser.add_argument("--youngs_modulus", type=float, default=5e5, help="Young's modulus for deformable wall in --mode soft.")
+parser.add_argument("--youngs_modulus", type=float, default=3e3, help="Young's modulus for deformable wall in --mode soft.")
 parser.add_argument(
     "--compliant_contact_stiffness",
     type=float,
@@ -170,11 +170,19 @@ from source.franka import FRANKA_3_HIGH_PD_CFG  # noqa: E402
 
 FLOOR_WALL_INIT_POS = (0.50, -0.1, 0.03)
 FLOOR_WALL_INIT_ROT = (0.70710678, 0.0, -0.70710678, 0.0)
+K_ENV_AVG_FORCE_THRESHOLD_N = 2.0
+K_ENV_AVG_CONFIRM_STEPS = 3
 
 
 def _format_gain_tag() -> str:
     """Return the log-folder tag for the configured admittance gains."""
     return f"{args_cli.admittance_M:g}_{args_cli.admittance_B:g}_{args_cli.admittance_K:g}"
+
+
+def _format_soft_wall_tag() -> str:
+    """Return the soft-wall stiffness folder tag."""
+    mantissa, exp = f"{args_cli.youngs_modulus:.0e}".split("e")
+    return f"pa{mantissa}e{int(exp)}"
 
 
 def _enable_fractional_cutout_opacity():
@@ -394,10 +402,10 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
     run_dir = None
     if args_cli.log:
         logs_root = REPO_ROOT / "logs" / f"adaptive_admittance_floor_{args_cli.mode}"
-        gain_logs_root = logs_root / _format_gain_tag()
-        gain_logs_root.mkdir(parents=True, exist_ok=True)
-        run_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
-        run_dir = gain_logs_root / run_tag
+        if is_soft_mode:
+            run_dir = logs_root / _format_soft_wall_tag()
+        else:
+            run_dir = logs_root / _format_gain_tag()
         run_dir.mkdir(parents=True, exist_ok=True)
         ft_log_path = run_dir / "ft_env0.csv"
         ft_csv_file = open(ft_log_path, "w", newline="", encoding="utf-8")
@@ -557,6 +565,10 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
     ik_target_delta_norm = torch.zeros(scene.num_envs, device=sim.device)
     ik_target_out_of_limits = torch.zeros(scene.num_envs, dtype=torch.bool, device=sim.device)
     x_cmd_step_clipped = torch.zeros(scene.num_envs, dtype=torch.bool, device=sim.device)
+    k_env_est_sum = 0.0
+    k_env_est_count = 0
+    k_env_avg_confirm_counter = torch.zeros(scene.num_envs, dtype=torch.long, device=sim.device)
+    k_env_avg_active = torch.zeros(scene.num_envs, dtype=torch.bool, device=sim.device)
 
     steps_since_reset = 0
     count = 0
@@ -598,6 +610,8 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
                 admittance_offset.zero_()
                 admittance_velocity.zero_()
                 admittance_acceleration.zero_()
+                k_env_avg_confirm_counter.zero_()
+                k_env_avg_active.zero_()
                 waypoint_hold_counter = 0
                 steps_since_reset = 0
             else:
@@ -627,6 +641,14 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
                 f_compression_pos_filt = (
                     args_cli.force_filter_alpha * f_compression_pos_raw
                     + (1.0 - args_cli.force_filter_alpha) * f_compression_pos_filt
+                )
+                k_env_avg_confirm_counter = torch.where(
+                    f_compression_pos_filt > K_ENV_AVG_FORCE_THRESHOLD_N,
+                    k_env_avg_confirm_counter + 1,
+                    torch.zeros_like(k_env_avg_confirm_counter),
+                )
+                k_env_avg_active = torch.logical_or(
+                    k_env_avg_active, k_env_avg_confirm_counter >= K_ENV_AVG_CONFIRM_STEPS
                 )
 
                 # Contact detection only during final-goal approach and after delay.
@@ -680,6 +702,11 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
                 x_nominal_b = ee_target_pose_b[:, 0:3]
                 x_delta_b = x_curr_b - x_nominal_b
                 x_curr_n = torch.sum(x_delta_b * contact_axis_b.unsqueeze(0), dim=-1)
+                valid_k_env = torch.logical_and(k_env_avg_active, x_curr_n > 1.0e-6)
+                if torch.any(valid_k_env):
+                    k_env_est = f_compression_pos_filt[valid_k_env] / x_curr_n[valid_k_env]
+                    k_env_est_sum += float(torch.sum(k_env_est).item())
+                    k_env_est_count += int(k_env_est.numel())
                 x_cmd_n_prev = torch.sum((x_cmd_prev_b - x_nominal_b) * contact_axis_b.unsqueeze(0), dim=-1)
                 tracking_error_n_prev = x_cmd_n_prev - x_curr_n
 
@@ -879,6 +906,18 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
             steps_since_reset += 1
 
     finally:
+        if k_env_est_count > 0:
+            print(
+                "[INFO] Average K_env estimate after "
+                f"Fcomp>{K_ENV_AVG_FORCE_THRESHOLD_N:g} N for {K_ENV_AVG_CONFIRM_STEPS} consecutive steps: "
+                f"{k_env_est_sum / k_env_est_count:.6g} N/m"
+            )
+        else:
+            print(
+                "[INFO] Average K_env estimate after "
+                f"Fcomp>{K_ENV_AVG_FORCE_THRESHOLD_N:g} N for {K_ENV_AVG_CONFIRM_STEPS} consecutive steps: "
+                "unavailable (no valid samples)"
+            )
         if ft_csv_file is not None:
             ft_csv_file.close()
         if video_writer is not None:

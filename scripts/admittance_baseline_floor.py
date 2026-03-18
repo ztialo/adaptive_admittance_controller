@@ -51,7 +51,7 @@ parser.add_argument(
     help="Environment mode: rigid wall, deformable soft wall, or rigid wall with compliant contact.",
 )
 parser.add_argument("--soft", action="store_true", default=False, help=argparse.SUPPRESS)
-parser.add_argument("--youngs_modulus", type=float, default=5e5, help="Young's modulus for deformable wall in --mode soft.")
+parser.add_argument("--youngs_modulus", type=float, default=2e2, help="Young's modulus for deformable wall in --mode soft.")
 parser.add_argument(
     "--compliant_contact_stiffness",
     type=float,

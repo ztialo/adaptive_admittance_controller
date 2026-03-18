@@ -10,6 +10,11 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 
+K_ENV_PLOT_FORCE_THRESHOLD_N = 2.0
+K_ENV_PLOT_CONFIRM_STEPS = 3
+K_ENV_PLOT_RESET_STEPS = 500
+
+
 def _float_or_nan(value: str | None) -> float:
     if value is None or value == "":
         return np.nan
@@ -44,12 +49,6 @@ def main():
     mode_values: list[str] = []
     x_cmd_n_values: list[float] = []
     x_curr_n_values: list[float] = []
-    tracking_error_n_values: list[float] = []
-    admittance_integrate_enabled_values: list[float] = []
-    non_contact_correction_mag_values: list[float] = []
-    ik_target_delta_norm_values: list[float] = []
-    ik_target_out_of_limits_values: list[float] = []
-    x_cmd_step_clipped_values: list[float] = []
 
     with args.csv_path.open("r", newline="") as f:
         reader = csv.DictReader(f)
@@ -67,13 +66,6 @@ def main():
         has_x_ddot_col = "admittance_acceleration" in fieldnames
         has_x_cmd_n_col = "x_cmd_n" in fieldnames
         has_x_curr_n_col = "x_curr_n" in fieldnames
-        has_tracking_error_n_col = "tracking_error_n" in fieldnames
-        has_aw_gate_col = "admittance_integrate_enabled" in fieldnames
-        has_nc_mag_col = "non_contact_correction_mag" in fieldnames
-        has_ik_delta_col = "ik_target_delta_norm" in fieldnames
-        has_ik_oob_col = "ik_target_out_of_limits" in fieldnames
-        has_step_clip_col = "x_cmd_step_clipped" in fieldnames
-
         has_f_des_col = "f_des_n" in fieldnames
         has_f_comp_filt_col = "f_compression_pos_filt" in fieldnames
         has_fz_col = "fz" in fieldnames
@@ -113,19 +105,6 @@ def main():
                 x_cmd_n_values.append(_float_or_nan(row.get("x_cmd_n")))
             if has_x_curr_n_col:
                 x_curr_n_values.append(_float_or_nan(row.get("x_curr_n")))
-            if has_tracking_error_n_col:
-                tracking_error_n_values.append(_float_or_nan(row.get("tracking_error_n")))
-            if has_aw_gate_col:
-                admittance_integrate_enabled_values.append(_float_or_nan(row.get("admittance_integrate_enabled")))
-            if has_nc_mag_col:
-                non_contact_correction_mag_values.append(_float_or_nan(row.get("non_contact_correction_mag")))
-            if has_ik_delta_col:
-                ik_target_delta_norm_values.append(_float_or_nan(row.get("ik_target_delta_norm")))
-            if has_ik_oob_col:
-                ik_target_out_of_limits_values.append(_float_or_nan(row.get("ik_target_out_of_limits")))
-            if has_step_clip_col:
-                x_cmd_step_clipped_values.append(_float_or_nan(row.get("x_cmd_step_clipped")))
-
     if not force_values:
         raise ValueError("No valid rows found in CSV.")
 
@@ -230,15 +209,11 @@ def main():
     else:
         plt.close(fig)
 
-    # Optional diagnostics figure for command-path / windup analysis.
-    has_diag = (
-        len(x_cmd_n_values) == len(x)
-        and len(x_curr_n_values) == len(x)
-        and len(tracking_error_n_values) == len(x)
-    )
+    # Optional diagnostics figure with environment-stiffness estimation.
+    has_diag = len(x_cmd_n_values) == len(x) and len(x_curr_n_values) == len(x)
     if has_diag:
-        fig2, ax2 = plt.subplots(5, 1, figsize=(14, 14), sharex=True)
-        ax_force, ax_adm, ax_xn, ax_track, ax_pipe = ax2
+        fig2, ax2 = plt.subplots(4, 1, figsize=(14, 12), sharex=True)
+        ax_force, ax_adm, ax_xn, ax_kenv = ax2
 
         ax_force.plot(x, force_meas, linewidth=1.2, color="tab:blue", label=force_label)
         if f_des is not None and len(f_des) == len(force_meas):
@@ -265,36 +240,51 @@ def main():
         ax_xn.grid(True, alpha=0.3)
         ax_xn.legend(loc="best")
 
-        ax_track.plot(x, np.asarray(tracking_error_n_values), color="tab:red", linewidth=1.2, label="tracking_error_n")
-        if len(admittance_integrate_enabled_values) == len(x):
-            ax_track.plot(
-                x,
-                np.asarray(admittance_integrate_enabled_values),
-                color="tab:olive",
-                linewidth=1.0,
-                label="integrate_enabled",
-            )
-        ax_track.set_ylabel("m / bool")
-        ax_track.set_title("Tracking Error + Anti-Windup Gate")
-        ax_track.grid(True, alpha=0.3)
-        ax_track.legend(loc="best")
+        x_curr_n = np.asarray(x_curr_n_values, dtype=float)
+        k_env_active = np.zeros_like(x_curr_n, dtype=bool)
+        confirm_counter = 0
+        for idx, force_val in enumerate(force_meas):
+            if idx % K_ENV_PLOT_RESET_STEPS == 0:
+                confirm_counter = 0
+            if np.isfinite(force_val) and force_val > K_ENV_PLOT_FORCE_THRESHOLD_N:
+                confirm_counter += 1
+            else:
+                confirm_counter = 0
+            if confirm_counter >= K_ENV_PLOT_CONFIRM_STEPS:
+                k_env_active[idx] = True
+        for start_idx in range(0, len(k_env_active), K_ENV_PLOT_RESET_STEPS):
+            end_idx = min(start_idx + K_ENV_PLOT_RESET_STEPS, len(k_env_active))
+            k_env_active[start_idx:end_idx] = np.logical_or.accumulate(k_env_active[start_idx:end_idx])
+        min_penetration = 1.0e-5
+        k_env_est = np.zeros_like(x_curr_n, dtype=float)
+        valid_k_env = np.isfinite(force_meas) & np.isfinite(x_curr_n) & (x_curr_n > min_penetration) & k_env_active
+        k_env_est[valid_k_env] = force_meas[valid_k_env] / x_curr_n[valid_k_env]
 
-        if len(non_contact_correction_mag_values) == len(x):
-            ax_pipe.plot(
-                x, np.asarray(non_contact_correction_mag_values), color="tab:brown", linewidth=1.2, label="non_contact_corr_mag"
-            )
-        if len(ik_target_delta_norm_values) == len(x):
-            ax_pipe.plot(x, np.asarray(ik_target_delta_norm_values), color="tab:cyan", linewidth=1.1, label="ik_target_delta_norm")
-        if len(ik_target_out_of_limits_values) == len(x):
-            ax_pipe.plot(x, np.asarray(ik_target_out_of_limits_values), color="tab:pink", linewidth=1.0, label="ik_target_out_of_limits")
-        if len(x_cmd_step_clipped_values) == len(x):
-            ax_pipe.plot(x, np.asarray(x_cmd_step_clipped_values), color="tab:gray", linewidth=1.0, label="x_cmd_step_clipped")
-        ax_pipe.set_ylabel("mixed")
-        ax_pipe.set_xlabel(x_label)
-        ax_pipe.set_title("Pipeline Indicators")
-        ax_pipe.grid(True, alpha=0.3)
-        if ax_pipe.has_data():
-            ax_pipe.legend(loc="best")
+        k_env_est_smooth = np.zeros_like(k_env_est, dtype=float)
+        alpha = 0.15
+        ema_val = 0.0
+        for idx, value in enumerate(k_env_est):
+            if k_env_active[idx] and np.isfinite(value):
+                ema_val = alpha * value + (1.0 - alpha) * ema_val
+            else:
+                ema_val = 0.0
+            k_env_est_smooth[idx] = ema_val
+
+        if np.any(np.isfinite(k_env_est_smooth)):
+            ax_kenv.plot(x, k_env_est_smooth, color="tab:red", linewidth=1.4, label="K_env est EMA")
+        if stiffness_values:
+            stiff = np.asarray(stiffness_values, dtype=float)
+            finite_stiff = stiff[np.isfinite(stiff)]
+            if finite_stiff.size > 0:
+                unique_stiff = np.unique(finite_stiff)
+                if unique_stiff.size == 1:
+                    ax_kenv.axhline(unique_stiff[0], color="tab:blue", linestyle="--", linewidth=1.0, label="configured stiffness")
+        ax_kenv.set_ylabel("N/m")
+        ax_kenv.set_xlabel(x_label)
+        ax_kenv.set_title("Environment Stiffness Estimate")
+        ax_kenv.grid(True, alpha=0.3)
+        if ax_kenv.has_data():
+            ax_kenv.legend(loc="best")
 
         fig2.suptitle(f"{title}\nDiagnostics")
         plt.tight_layout()
